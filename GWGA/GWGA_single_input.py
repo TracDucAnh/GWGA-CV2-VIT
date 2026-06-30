@@ -762,9 +762,10 @@ def run_and_plot_umap(model, probe_batch, tag, global_step, epoch, phase, cfg, s
 
 
 def run_and_plot_dual_umap(teacher_model, student_model, teacher_probe, student_probe,
-                           global_step, epoch, phase, cfg, style=DEFAULT_STYLE):
-    run_and_plot_umap(teacher_model, teacher_probe, "teacher", global_step, epoch, phase, cfg, style)
-    run_and_plot_umap(student_model, student_probe, "student", global_step, epoch, phase, cfg, style)
+                           global_step, epoch, phase, cfg, style=DEFAULT_STYLE,
+                           teacher_tag="teacher", student_tag="student"):
+    run_and_plot_umap(teacher_model, teacher_probe, teacher_tag, global_step, epoch, phase, cfg, style)
+    run_and_plot_umap(student_model, student_probe, student_tag, global_step, epoch, phase, cfg, style)
 
 
 # =========================================================================
@@ -1074,6 +1075,15 @@ def fit_teacher(cfg: Config) -> Tuple[str, List[Dict]]:
     (teacher_finetune_backbone=False), trong khi BLL head luon hoc tu dau
     qua ELBO. So epoch fit teacher = so epoch distill student (CFG.teacher_num_epochs
     da duoc gan = CFG.student_num_epochs ngay sau khi tao CFG).
+
+    LUU Y (fix bug UMAP bi de): tag UMAP cua giai doan nay la "teacher_fit"
+    (KHONG phai "teacher" trung voi giai doan distill) -- global_step o day
+    la mot counter rieng, doc lap voi global_step trong distill_student().
+    Neu dung chung tag "teacher", file
+    figures/umap/teacher_step_000100.png va figure_data/umap_teacher_step_000100.*
+    se bi GHI DE boi UMAP cua teacher (frozen) trong giai doan distill khi
+    hai counter cung cham step 100, 200, ... -- lam mat vinh vien UMAP cua
+    teacher luc dang fit.
     """
     print(f"\n{'='*80}\nSTAGE 1: FITTING TEACHER BLL (pretrained backbone) -- {cfg.teacher_name}\n{'='*80}")
 
@@ -1157,7 +1167,9 @@ def fit_teacher(cfg: Config) -> Tuple[str, List[Dict]]:
                 global_step += 1
 
                 if global_step % cfg.umap_every_n_steps == 0:
-                    run_and_plot_umap(model, umap_probe, "teacher", global_step, epoch, "fit", cfg)
+                    # FIX: tag "teacher_fit" (truoc la "teacher") de KHONG
+                    # trung voi tag cua teacher ben giai doan distill_student().
+                    run_and_plot_umap(model, umap_probe, "teacher_fit", global_step, epoch, "fit", cfg)
                     model.train()
 
             epoch_ce      += ce.item()
@@ -1225,7 +1237,16 @@ def fit_teacher(cfg: Config) -> Tuple[str, List[Dict]]:
 def distill_student(cfg: Config, teacher_ckpt_path: str, teacher_model_for_umap: BLLViTClassifier
                     ) -> Tuple[str, List[Dict]]:
     """Student = ViT-Small KHONG pretrained (distill tu dau). 3-phase
-    schedule + ELBO + GW single-input, giong logic ban CNN."""
+    schedule + ELBO + GW single-input, giong logic ban CNN.
+
+    LUU Y (fix bug UMAP bi de): tag UMAP cua teacher/student trong giai
+    doan nay la "teacher_distill"/"student_distill" (truoc la "teacher"/
+    "student"). global_step o day la mot counter rieng, doc lap voi
+    global_step trong fit_teacher() -- ca hai deu bat dau tu 0 va cung
+    cham cfg.umap_every_n_steps, nen neu dung chung tag "teacher" thi UMAP
+    cua teacher luc fit (stage 1) se bi GHI DE boi UMAP cua teacher
+    (frozen) o stage nay khi global_step trung nhau (100, 200, ...).
+    """
     print(f"\n{'='*80}\nSTAGE 2: DISTILLING STUDENT -- {cfg.student_name}\n{'='*80}")
 
     student = BLLViTClassifier.from_timm_name(
@@ -1329,10 +1350,14 @@ def distill_student(cfg: Config, teacher_ckpt_path: str, teacher_model_for_umap:
                 global_step += 1
 
                 if global_step % cfg.umap_every_n_steps == 0:
+                    # FIX: tag rieng cho stage distill ("teacher_distill" /
+                    # "student_distill") de KHONG trung voi tag "teacher_fit"
+                    # cua stage 1, du global_step cua 2 stage co the trung nhau.
                     run_and_plot_dual_umap(
                         teacher_model=teacher_model_for_umap, student_model=student,
                         teacher_probe=teacher_umap_probe, student_probe=student_umap_probe,
                         global_step=global_step, epoch=epoch, phase=phase, cfg=cfg,
+                        teacher_tag="teacher_distill", student_tag="student_distill",
                     )
                     student.train()
 

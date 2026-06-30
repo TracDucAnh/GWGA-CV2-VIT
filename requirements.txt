@@ -7,3 +7,4 @@ torchvision
 scikit-learn
 umap-learn
 tqdm
+timm
