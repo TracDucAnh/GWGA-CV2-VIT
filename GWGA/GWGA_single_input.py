@@ -109,8 +109,33 @@ from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 import torchvision
 import torchvision.transforms as T
 import torchvision.models as tvm
+from PIL import Image
 
 warnings.filterwarnings("ignore")
+
+
+# =========================================================================
+# DATASET PATHS (du lieu DA TAI VE SAN, nam trong thu muc `dataset/` o
+# project root -- KHONG bao gio tai lai/download trong code train).
+# =========================================================================
+# Cay thu muc thuc te (xem screenshot project):
+#   GWGA-CV2-VIT/
+#     dataset/
+#       cifar-10/   {train,test}_images.npy, {train,test}_labels.npy, classes.txt
+#       cifar-100/  {train,test}_images.npy, {train,test}_labels.npy,
+#                   {train,test}_coarse_labels.npy, fine_classes.txt, coarse_classes.txt
+#     GWGA/
+#       GWGA_single_input.py   <-- file nay
+#
+# Duong dan duoc tinh TUONG DOI theo vi tri cua chinh file nay (__file__),
+# KHONG phu thuoc cwd luc chay script -> luon tro dung "../dataset" du
+# script duoc goi tu dau (vd `python GWGA/GWGA_single_input.py` tu root,
+# hay `python GWGA_single_input.py` tu trong thu muc GWGA/).
+_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+_PROJECT_ROOT = os.path.dirname(_THIS_DIR)
+_DEFAULT_DATASET_ROOT = os.path.join(_PROJECT_ROOT, "dataset")
+_DEFAULT_CIFAR10_DIR = os.path.join(_DEFAULT_DATASET_ROOT, "cifar-10")
+_DEFAULT_CIFAR100_DIR = os.path.join(_DEFAULT_DATASET_ROOT, "cifar-100")
 
 
 # =========================================================================
@@ -128,10 +153,17 @@ class Config:
 
     # ── Data ──────────────────────────────────────────────────────────────
     # Train + eval-in-distribution: CIFAR-100. OOD test: CIFAR-10.
+    # QUAN TRONG: du lieu DA duoc tai ve san duoi dang .npy trong thu muc
+    # `dataset/cifar-10` va `dataset/cifar-100` (xem _DEFAULT_CIFAR10_DIR /
+    # _DEFAULT_CIFAR100_DIR o dau file). KHONG dung torchvision.datasets
+    # voi download=True o bat ky dau trong file nay -- xem NpyImageDataset
+    # va cac ham build_*_loader(s) ben duoi, tat ca deu doc thang tu .npy
+    # tren dia, khong bao gio goi mang.
     train_dataset: str = "cifar100"
     id_eval_dataset: str = "cifar100"
     ood_dataset: str = "cifar10"
-    data_root: str = "./data"
+    cifar10_dir: str = _DEFAULT_CIFAR10_DIR
+    cifar100_dir: str = _DEFAULT_CIFAR100_DIR
     num_labels: int = 100               # so class CIFAR-100
     num_workers: int = 4
 
@@ -201,6 +233,24 @@ class Config:
     # theta*, vi running stats cu khong con khop sau khi trong so bi nhieu.
     # Xem ghi chu lon o dau file va ham _bn_use_batch_stats_context().
     landscape_bn_use_batch_stats: bool = True
+
+    # ── ECE (Expected Calibration Error) ─────────────────────────────────
+    # Metric hieu chuan (calibration), Sec 6.2 cua paper: "accuracy, ECE,
+    # and Hessian-trace sharpness". Tinh tren posterior-predictive softmax
+    # (trung binh qua particle, giong cach tinh "accuracy") VA tren
+    # mean-forward softmax (giong "accuracy_mean"). Xem compute_ece().
+    ece_num_bins: int = 15
+
+    # ── Hessian-trace sharpness (necessary-condition gap, Proposition 5.3) ─
+    # Uoc luong Tr(H) cua CE loss (mean-forward, tai theta*) bang Hutchinson
+    # estimator (Rademacher random vectors + Hessian-vector products qua
+    # double backprop), giong PyHessian / Yao et al. 2020. Dung CHUNG bo
+    # eval-batch nho, co dinh voi loss landscape (build_landscape_loader)
+    # vi cung phuc vu muc dich do "do phang/sac" quanh theta* -- xem
+    # evaluate_hessian_trace_sharpness().
+    hessian_num_hutchinson_samples: int = 10
+    hessian_eval_batches: int = 5      # so batch (tu landscape loader) dung de trung binh
+    hessian_seed: int = 777
 
     # ── OOD evaluation (CIFAR-10 dung lam OOD cho model train tren CIFAR-100) ─
     ood_num_particles: int = 16
@@ -345,13 +395,71 @@ def build_cnn_transforms(cfg: Config, train: bool) -> T.Compose:
     return T.Compose(ops)
 
 
+class NpyImageDataset(Dataset):
+    """
+    Dataset CIFAR-10/100 doc TRUC TIEP tu cac file .npy DA CO SAN tren dia
+    (dataset/cifar-10/ hoac dataset/cifar-100/), thay cho
+    torchvision.datasets.CIFARxx(..., download=True). KHONG bao gio goi
+    mang -- neu thieu file se bao loi ro rang (FileNotFoundError) thay vi
+    tu dong tai ve.
+
+    Gia dinh format (dung chuan khi dump tu torchvision.datasets.CIFARxx,
+    vd `np.save(path, dataset.data)`):
+      - images_path : uint8, shape [N, 32, 32, 3] (HWC, RGB). Neu phat hien
+                      shape kieu [N, 3, 32, 32] (CHW), tu dong chuyen ve
+                      HWC de Image.fromarray() hoat dong dung.
+      - labels_path : int, shape [N].
+    """
+    def __init__(self, images_path: str, labels_path: str, transform=None):
+        if not os.path.isfile(images_path):
+            raise FileNotFoundError(
+                f"[NpyImageDataset] Khong tim thay file anh: {images_path}\n"
+                f"  -> Du lieu duoc gia dinh la DA TAI VE SAN (xem cfg.cifar10_dir / "
+                f"cfg.cifar100_dir). File nay KHONG tu dong tai ve du lieu."
+            )
+        if not os.path.isfile(labels_path):
+            raise FileNotFoundError(f"[NpyImageDataset] Khong tim thay file nhan: {labels_path}")
+
+        self.images = np.load(images_path)
+        self.labels = np.load(labels_path).astype(np.int64).reshape(-1)
+        if self.images.ndim != 4:
+            raise ValueError(
+                f"[NpyImageDataset] Mong doi anh 4 chieu [N,H,W,C] hoac [N,C,H,W], "
+                f"nhung nhan duoc shape={self.images.shape} tu {images_path}")
+        # CHW -> HWC neu can (so sanh truc tiep voi truong hop HWC chuan).
+        if self.images.shape[1] == 3 and self.images.shape[-1] != 3:
+            self.images = self.images.transpose(0, 2, 3, 1)
+        if self.images.dtype != np.uint8:
+            self.images = self.images.astype(np.uint8)
+        assert len(self.images) == len(self.labels), (
+            f"[NpyImageDataset] So anh ({len(self.images)}) != so nhan ({len(self.labels)}) "
+            f"trong {images_path} / {labels_path}")
+
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.images)
+
+    def __getitem__(self, idx):
+        img = Image.fromarray(self.images[idx])
+        label = int(self.labels[idx])
+        if self.transform is not None:
+            img = self.transform(img)
+        return img, label
+
+
 def build_cifar100_loaders(cfg: Config, batch_size: int):
+    """Doc CIFAR-100 train/test TU .npy CO SAN trong cfg.cifar100_dir (khong tai lai)."""
     train_tf = build_cnn_transforms(cfg, train=True)
     eval_tf  = build_cnn_transforms(cfg, train=False)
-    train_set = torchvision.datasets.CIFAR100(
-        root=cfg.data_root, train=True, download=True, transform=train_tf)
-    eval_set = torchvision.datasets.CIFAR100(
-        root=cfg.data_root, train=False, download=True, transform=eval_tf)
+    train_set = NpyImageDataset(
+        os.path.join(cfg.cifar100_dir, "train_images.npy"),
+        os.path.join(cfg.cifar100_dir, "train_labels.npy"),
+        transform=train_tf)
+    eval_set = NpyImageDataset(
+        os.path.join(cfg.cifar100_dir, "test_images.npy"),
+        os.path.join(cfg.cifar100_dir, "test_labels.npy"),
+        transform=eval_tf)
     train_loader = DataLoader(
         train_set, batch_size=batch_size, shuffle=True,
         num_workers=cfg.num_workers, pin_memory=True, drop_last=True,
@@ -365,13 +473,16 @@ def build_cifar100_loaders(cfg: Config, batch_size: int):
 
 def build_cifar10_ood_loader(cfg: Config, batch_size: int):
     """
-    CIFAR-10 dung LAM OOD test set cho model train tren CIFAR-100. Khong
-    can nhan that (label CIFAR-10 khong tuong ung voi 100-class head cua
-    model), chi can anh -> dung de do do bat dinh / OOD score.
+    CIFAR-10 dung LAM OOD test set cho model train tren CIFAR-100, doc TU
+    .npy CO SAN trong cfg.cifar10_dir (khong tai lai). Khong can nhan that
+    (label CIFAR-10 khong tuong ung voi 100-class head cua model), chi can
+    anh -> dung de do do bat dinh / OOD score.
     """
     eval_tf = build_cnn_transforms(cfg, train=False)
-    ood_set = torchvision.datasets.CIFAR10(
-        root=cfg.data_root, train=False, download=True, transform=eval_tf)
+    ood_set = NpyImageDataset(
+        os.path.join(cfg.cifar10_dir, "test_images.npy"),
+        os.path.join(cfg.cifar10_dir, "test_labels.npy"),
+        transform=eval_tf)
     return DataLoader(
         ood_set, batch_size=batch_size, shuffle=False,
         num_workers=cfg.num_workers, pin_memory=True, drop_last=False,
@@ -394,15 +505,20 @@ class _FixedIndexSubset(Dataset):
 def build_umap_probe_batch(cfg: Config, dataset_name: str = "cifar100") -> dict:
     """
     Tao 1 mini-batch CO DINH (theo umap_seed) dung de ve UMAP xuyen suot
-    training. Tra ve dict {"images": Tensor[B,3,H,W], "labels": Tensor[B]}.
+    training, doc tu .npy CO SAN (khong tai lai). Tra ve dict
+    {"images": Tensor[B,3,H,W], "labels": Tensor[B]}.
     """
     eval_tf = build_cnn_transforms(cfg, train=False)
     if dataset_name == "cifar100":
-        base = torchvision.datasets.CIFAR100(
-            root=cfg.data_root, train=True, download=True, transform=eval_tf)
+        base = NpyImageDataset(
+            os.path.join(cfg.cifar100_dir, "train_images.npy"),
+            os.path.join(cfg.cifar100_dir, "train_labels.npy"),
+            transform=eval_tf)
     else:
-        base = torchvision.datasets.CIFAR10(
-            root=cfg.data_root, train=True, download=True, transform=eval_tf)
+        base = NpyImageDataset(
+            os.path.join(cfg.cifar10_dir, "train_images.npy"),
+            os.path.join(cfg.cifar10_dir, "train_labels.npy"),
+            transform=eval_tf)
 
     rng = np.random.default_rng(cfg.umap_seed)
     indices = rng.choice(len(base), size=cfg.umap_probe_samples, replace=False).tolist()
@@ -413,10 +529,16 @@ def build_umap_probe_batch(cfg: Config, dataset_name: str = "cifar100") -> dict:
 
 
 def build_landscape_loader(cfg: Config):
-    """Loader nho, co dinh, dung de danh gia loss khi quet loss landscape."""
+    """
+    Loader nho, co dinh, dung de danh gia loss khi quet loss landscape (va
+    khi uoc luong Hessian-trace sharpness), doc tu .npy CO SAN (khong tai
+    lai du lieu).
+    """
     eval_tf = build_cnn_transforms(cfg, train=False)
-    base = torchvision.datasets.CIFAR100(
-        root=cfg.data_root, train=True, download=True, transform=eval_tf)
+    base = NpyImageDataset(
+        os.path.join(cfg.cifar100_dir, "train_images.npy"),
+        os.path.join(cfg.cifar100_dir, "train_labels.npy"),
+        transform=eval_tf)
     n_needed = cfg.landscape_eval_batches * cfg.landscape_eval_batch_size
     rng = np.random.default_rng(cfg.landscape_seed)
     indices = rng.choice(len(base), size=n_needed, replace=False).tolist()
@@ -859,19 +981,65 @@ def student_schedule_weights(epoch, cfg: Config):
 # EVALUATION  (in-distribution: accuracy/F1 nhu cu; them OOD entropy score)
 # =========================================================================
 
+# =========================================================================
+# ECE (Expected Calibration Error)  -- Sec 6.2: "accuracy, ECE, and
+# Hessian-trace sharpness" cua benchmark CV-2.
+# =========================================================================
+
+def compute_ece(probs: np.ndarray, labels: np.ndarray, n_bins: int = 15) -> float:
+    """
+    Expected Calibration Error (Naeini et al. 2015 / Guo et al. 2017,
+    "On Calibration of Modern Neural Networks").
+
+    probs  : [N, C] xac suat du doan (vd posterior-predictive softmax, da
+             trung binh qua K particle, hoac mean-forward softmax).
+    labels : [N] nhan that.
+
+    Chia [0, 1] thanh n_bins bin deu theo confidence = max_c probs[n, c].
+    Voi moi bin: do lech |accuracy(bin) - confidence(bin)|, trong so theo
+    ty le so sample roi vao bin do (|bin| / N). ECE = tong trong so cac
+    do lech nay -- cang gan 0 nghia la model cang "hieu chuan tot"
+    (confidence phan anh dung xac suat dung thuc te).
+    """
+    confidences = probs.max(axis=1)
+    predictions = probs.argmax(axis=1)
+    accuracies  = (predictions == labels).astype(np.float64)
+
+    bin_boundaries = np.linspace(0.0, 1.0, n_bins + 1)
+    n = len(labels)
+    ece = 0.0
+    for lo, hi in zip(bin_boundaries[:-1], bin_boundaries[1:]):
+        in_bin = (confidences > lo) & (confidences <= hi)
+        if not np.any(in_bin):
+            continue
+        bin_acc    = accuracies[in_bin].mean()
+        bin_conf   = confidences[in_bin].mean()
+        bin_weight = in_bin.sum() / n
+        ece += bin_weight * abs(bin_acc - bin_conf)
+    return float(ece)
+
+
 @torch.no_grad()
-def evaluate_classification_metrics(model: BLLCNNClassifier, loader, device, dtype, num_particles):
+def evaluate_classification_metrics(model: BLLCNNClassifier, loader, device, dtype, num_particles,
+                                    ece_num_bins: int = 15):
     """
     Giu nguyen logic tu ban GPT2: K particles duoc SAMPLE 1 LAN DUY NHAT o
     batch dau (W co dinh cho ca eval set), tra ve ca posterior-predictive
     (accuracy/f1) lan mean-forward (accuracy_mean/f1_mean) va per-particle
     max/min (accuracy_max/min, f1_max/min).
+
+    THEM MOI: ece / ece_mean -- Expected Calibration Error (xem
+    compute_ece()), tinh tren cung 2 bo xac suat dung de tinh
+    accuracy/accuracy_mean (posterior-predictive va mean-forward), cung
+    bin-config voi cfg.ece_num_bins (truyen vao qua ece_num_bins).
     """
     model.eval()
-    all_labels      = []
-    postpred_preds  = []
-    mean_preds      = []
-    particle_preds  = [[] for _ in range(num_particles)]
+    all_labels       = []
+    postpred_preds   = []
+    mean_preds       = []
+    particle_preds   = [[] for _ in range(num_particles)]
+    postpred_probs   = []   # [N, C] -- de tinh ECE (posterior-predictive)
+    mean_probs       = []   # [N, C] -- de tinh ECE (mean-forward)
     total_loss, n_batches = 0.0, 0
     W = None
 
@@ -894,9 +1062,12 @@ def evaluate_classification_metrics(model: BLLCNNClassifier, loader, device, dty
             particle_logits.reshape(B * K, C),
             labels.unsqueeze(1).expand(-1, K).reshape(-1),
         )
-        probs = F.softmax(particle_logits, dim=-1).mean(dim=1)
+        probs      = F.softmax(particle_logits, dim=-1).mean(dim=1)   # posterior-predictive [B,C]
+        mean_probs_b = F.softmax(mean_logits, dim=-1)                  # mean-forward [B,C]
         postpred_preds.extend(torch.argmax(probs, dim=-1).cpu().tolist())
         mean_preds.extend(torch.argmax(mean_logits, dim=-1).cpu().tolist())
+        postpred_probs.append(probs.cpu().numpy())
+        mean_probs.append(mean_probs_b.cpu().numpy())
         for k in range(K):
             particle_preds[k].extend(torch.argmax(particle_logits[:, k, :], dim=-1).cpu().tolist())
 
@@ -906,6 +1077,12 @@ def evaluate_classification_metrics(model: BLLCNNClassifier, loader, device, dty
 
     acc_per_particle = [accuracy_score(all_labels, particle_preds[k]) for k in range(num_particles)]
     f1_per_particle  = [f1_score(all_labels, particle_preds[k], average="macro") for k in range(num_particles)]
+
+    all_labels_np     = np.array(all_labels, dtype=np.int64)
+    postpred_probs_np = np.concatenate(postpred_probs, axis=0)
+    mean_probs_np     = np.concatenate(mean_probs, axis=0)
+    ece      = compute_ece(postpred_probs_np, all_labels_np, n_bins=ece_num_bins)
+    ece_mean = compute_ece(mean_probs_np, all_labels_np, n_bins=ece_num_bins)
 
     return {
         "loss":          total_loss / max(1, n_batches),
@@ -917,6 +1094,8 @@ def evaluate_classification_metrics(model: BLLCNNClassifier, loader, device, dty
         "accuracy_min":  min(acc_per_particle),
         "f1_max":        max(f1_per_particle),
         "f1_min":        min(f1_per_particle),
+        "ece":           ece,
+        "ece_mean":      ece_mean,
     }
 
 
@@ -964,6 +1143,102 @@ def evaluate_ood_auroc(model: BLLCNNClassifier, id_loader, ood_loader, cfg: Conf
 
 
 # =========================================================================
+# HESSIAN-TRACE SHARPNESS  (Sec 6.2: "accuracy, ECE, and Hessian-trace
+# sharpness, used specifically to test the necessary-condition gap of
+# Proposition 5.3."). Uoc luong Tr(H) bang Hutchinson estimator + double
+# backprop (Pearlmutter 1994 Hessian-vector product), cung tinh than voi
+# PyHessian (Yao et al., 2020, "PyHessian: Neural Networks Through the
+# Lens of the Hessian"). Hessian o day la cua mean-forward CE loss
+# (giong loss dung trong evaluate_classification_loss() cho loss
+# landscape) theo TOAN BO tham so co the train cua model, tai theta*
+# HIEN TAI (KHONG perturb -- khac voi loss landscape).
+# =========================================================================
+
+def compute_hessian_trace(model: BLLCNNClassifier, params: List[torch.Tensor],
+                          images: torch.Tensor, labels: torch.Tensor,
+                          num_hutchinson_samples: int, seed: Optional[int] = None) -> float:
+    """
+    Tr(H) ~= (1/M) * sum_{i=1}^{M} z_i^T H z_i, voi z_i ~ Rademacher({-1,+1})
+    i.i.d. (Hutchinson, 1990), H = Hessian cua CE loss (mean-forward, tren
+    1 batch co dinh `images`/`labels`) theo `params`.
+
+    Toi uu: grad bac 1 (first_grads, create_graph=True) chi can tinh 1 LAN
+    cho ca M mau Hutchinson (vi no khong phu thuoc z_i); voi MOI z_i chi
+    can 1 lan backward bac 2 them: Hz_i = d(first_grads . z_i)/d(params).
+    Generator rieng (khong dung torch.manual_seed toan cuc) de KHONG lam
+    xao tron RNG stream chinh cua training loop (sampling particle weight,
+    dropout, data shuffling, ...) khi ham nay duoc goi xen giua cac epoch.
+    """
+    logits = model.forward_mean(images)
+    loss = F.cross_entropy(logits.float(), labels)
+    first_grads = torch.autograd.grad(loss, params, create_graph=True)
+
+    gen = torch.Generator()
+    if seed is not None:
+        gen.manual_seed(seed)
+
+    trace_samples = []
+    for i in range(num_hutchinson_samples):
+        vecs = [
+            (torch.randint(0, 2, p.shape, generator=gen).float() * 2.0 - 1.0).to(p.device, dtype=p.dtype)
+            for p in params
+        ]
+        dot = sum((g * v).sum() for g, v in zip(first_grads, vecs))
+        retain = i < num_hutchinson_samples - 1   # giai phong graph o lan cuoi de tiet kiem VRAM
+        hv = torch.autograd.grad(dot, params, retain_graph=retain)
+        trace_est = sum((h * v).sum().item() for h, v in zip(hv, vecs))
+        trace_samples.append(trace_est)
+    return float(np.mean(trace_samples))
+
+
+def evaluate_hessian_trace_sharpness(model: BLLCNNClassifier, loader, cfg: Config,
+                                     seed: Optional[int] = None) -> float:
+    """
+    Uoc luong Hessian-trace sharpness cua model HIEN TAI, trung binh qua
+    cfg.hessian_eval_batches batch co dinh lay tu `loader` (thuong la
+    build_landscape_loader(cfg), cung bo du lieu nho/co dinh dung cho loss
+    landscape, vi cung phuc vu do "do phang" quanh theta*) va
+    cfg.hessian_num_hutchinson_samples vector Rademacher cho moi batch.
+
+    QUAN TRONG:
+      - Ham nay can GRADIENT BAC 2 (double backprop) nen KHONG duoc goi
+        duoi torch.no_grad(); cung KHONG duoc trang trí @torch.no_grad().
+      - Chay o FULL PRECISION (KHONG boc trong torch.autocast) vi double
+        backward voi bfloat16 de mat on dinh so/tran gia tri hon nhieu so
+        voi forward/backward bac 1 thong thuong.
+      - Dung torch.autograd.grad() (KHONG goi loss.backward()) nen KHONG
+        ghi vao .grad cua tham so -> AN TOAN de goi xen giua training loop,
+        khong anh huong optimizer.step()/zero_grad() cua vong lap chinh.
+      - BatchNorm running_mean/running_var VAN HOP LE o day (khac voi loss
+        landscape): model dang o DUNG theta* hien tai, KHONG bi nhieu nhu
+        khi quet (alpha, beta), nen khong can _bn_use_batch_stats_context().
+      - Chi phi cao hon accuracy/F1/ECE nhieu lan (M backward bac 2 / batch),
+        nen so batch va so Hutchinson-sample duoc gioi han qua config.
+    """
+    was_training = model.training
+    model.eval()
+    params = [p for p in model.parameters() if p.requires_grad]
+
+    batch_traces = []
+    for i, (images, labels) in enumerate(loader):
+        if i >= cfg.hessian_eval_batches:
+            break
+        images = images.to(cfg.device, non_blocking=True)
+        labels = labels.to(cfg.device, non_blocking=True)
+        batch_seed = None if seed is None else seed + i
+        t = compute_hessian_trace(
+            model, params, images, labels,
+            num_hutchinson_samples=cfg.hessian_num_hutchinson_samples,
+            seed=batch_seed,
+        )
+        batch_traces.append(t)
+
+    if was_training:
+        model.train()
+    return float(np.mean(batch_traces)) if batch_traces else float("nan")
+
+
+# =========================================================================
 # STAGE 1: TEACHER FIT  (pretrained ResNet-50 backbone + BLL head)
 # =========================================================================
 
@@ -997,6 +1272,9 @@ def fit_teacher(cfg: Config) -> Tuple[str, List[Dict]]:
 
     print(f"[UMAP] Building teacher probe batch ({cfg.umap_probe_samples} samples)...")
     umap_probe = build_umap_probe_batch(cfg, dataset_name="cifar100")
+    print(f"[Hessian] Building fixed eval batches for Hessian-trace sharpness "
+          f"({cfg.hessian_eval_batches} batches x {cfg.landscape_eval_batch_size})...")
+    hessian_loader = build_landscape_loader(cfg)
 
     train_loader, eval_loader = build_cifar100_loaders(cfg, cfg.batch_size)
     n_train = len(train_loader.dataset)
@@ -1082,7 +1360,8 @@ def fit_teacher(cfg: Config) -> Tuple[str, List[Dict]]:
         avg_kl_term = epoch_kl_term / max(1, n_steps)
         avg_total   = epoch_total / max(1, n_steps)
         metrics = evaluate_classification_metrics(
-            model, eval_loader, cfg.device, cfg.mixed_precision_dtype, cfg.eval_num_particles)
+            model, eval_loader, cfg.device, cfg.mixed_precision_dtype, cfg.eval_num_particles,
+            ece_num_bins=cfg.ece_num_bins)
         elapsed = time.time() - t0
         s = get_sigma_stats(model)
 
@@ -1265,7 +1544,8 @@ def distill_student(cfg: Config, teacher_ckpt_path: str, teacher_model_for_umap:
         avg_gw_term = epoch_gw_term / max(1, n_steps)
         avg_total   = epoch_total / max(1, n_steps)
         metrics = evaluate_classification_metrics(
-            student, eval_loader, cfg.device, cfg.mixed_precision_dtype, cfg.eval_num_particles)
+            student, eval_loader, cfg.device, cfg.mixed_precision_dtype, cfg.eval_num_particles,
+            ece_num_bins=cfg.ece_num_bins)
         elapsed = time.time() - t0
         s = get_sigma_stats(student)
 
