@@ -92,6 +92,7 @@ import warnings
 from dataclasses import dataclass
 from typing import List, Tuple, Dict, Optional
 from pathlib import Path
+from matplotlib.colors import LogNorm
 
 import numpy as np
 import torch
@@ -1808,29 +1809,61 @@ def save_landscape_data(cfg: Config, data: dict):
             "model_key": key, "tag": tag,
         })
 
+def _clip_for_display(lg: np.ndarray, low_pct: float = 1.0, high_pct: float = 90.0) -> np.ndarray:
+    """
+    Clip 2 phia theo percentile (mac dinh [1, 90]) thay vi chi clip-tren-99
+    nhu ban cu. Voi loss landscape o day, chenh lech do lon giua vung day
+    phang (O(1)-O(10)) va vai diem ngoai bien no (O(1e7)-O(1e21)) co the
+    toi vai chuc bac do lon -- chi clip-tren-99 van chua du de tranh "nuot"
+    chi tiet vung tam.
+    """
+    lo = np.percentile(lg, low_pct)
+    hi = np.percentile(lg, high_pct)
+    if hi <= lo:
+        hi = lg.max()
+    return np.clip(lg, lo, hi)
 
-def _clip_for_display(lg):
-    return np.clip(lg, None, np.percentile(lg, 99))
-
+def _safe_lognorm(lg_clipped: np.ndarray) -> LogNorm:
+    """LogNorm an toan (vmin > 0), dich nhe neu co gia tri <= 0."""
+    vmin = float(lg_clipped.min())
+    vmax = float(lg_clipped.max())
+    if vmin <= 0:
+        eps = max(1e-8, 1e-6 * (vmax if vmax > 0 else 1.0))
+        vmin = eps
+        lg_clipped = lg_clipped + eps
+        vmax = float(lg_clipped.max())
+    if vmax <= vmin:
+        vmax = vmin * 10.0
+    return LogNorm(vmin=vmin, vmax=vmax)
 
 def _draw_3d_axis(ax, A, B, lg, key, fig, style: PlotStyle):
-    surf = ax.plot_surface(A, B, lg, cmap=style.cmap_name, linewidth=0, antialiased=True, edgecolor="none")
-    ax.set_title(f"{key} -- 3D", fontsize=style.subtitle_fontsize)
+    """Mau theo thang LOG; truc Z van la gia tri loss da clip (khong log)."""
+    norm = _safe_lognorm(lg)
+    facecolors = plt.get_cmap(style.cmap_name)(norm(lg))
+    surf = ax.plot_surface(A, B, lg, facecolors=facecolors, linewidth=0,
+                           antialiased=True, edgecolor="none", shade=False)
+    ax.set_title(f"{key} -- 3D (color: log scale)", fontsize=style.subtitle_fontsize)
     ax.set_xlabel("alpha", fontsize=style.label_fontsize)
     ax.set_ylabel("beta", fontsize=style.label_fontsize)
-    ax.set_zlabel("loss", fontsize=style.label_fontsize)
-    fig.colorbar(surf, ax=ax, shrink=0.6, pad=0.1)
+    ax.set_zlabel("loss (clipped)", fontsize=style.label_fontsize)
+    mappable = plt.cm.ScalarMappable(norm=norm, cmap=style.cmap_name)
+    mappable.set_array(lg)
+    fig.colorbar(mappable, ax=ax, shrink=0.6, pad=0.1, label="loss (log scale)")
+
 
 
 def _draw_2d_axis(ax, A, B, lg, key, fig, style: PlotStyle):
-    cs = ax.contourf(A, B, lg, levels=20, cmap=style.cmap_name)
-    ax.contour(A, B, lg, levels=20, colors="k", linewidths=0.3, alpha=0.4)
-    ax.set_title(f"{key} -- 2D", fontsize=style.subtitle_fontsize)
+    """Contour 2D voi thang mau LOG de phan giai vung day phang quanh theta*."""
+    norm = _safe_lognorm(lg)
+    levels = np.geomspace(norm.vmin, norm.vmax, 20)
+    cs = ax.contourf(A, B, lg, levels=levels, cmap=style.cmap_name, norm=norm)
+    ax.contour(A, B, lg, levels=levels, colors="k", linewidths=0.3, alpha=0.4)
+    ax.set_title(f"{key} -- 2D (color: log scale)", fontsize=style.subtitle_fontsize)
     ax.set_xlabel("alpha", fontsize=style.label_fontsize)
     ax.set_ylabel("beta", fontsize=style.label_fontsize)
     ax.scatter([0], [0], color="red", marker="*", s=150, label="theta* (posterior mean)")
     ax.legend(loc="upper right", fontsize=style.legend_fontsize)
-    fig.colorbar(cs, ax=ax, shrink=0.9)
+    fig.colorbar(cs, ax=ax, shrink=0.9, label="loss (log scale)")
 
 
 def plot_landscapes_all(data: dict, cfg: Config, title: str, save_name_prefix: str,
