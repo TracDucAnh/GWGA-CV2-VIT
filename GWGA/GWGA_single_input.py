@@ -14,11 +14,11 @@ Proposition 5.3:
                Layer (BLL). Backbone pretrained co the duoc finetune nhe
                hoac freeze; chi BLL head la thanh phan Bayesian moi.
                So epoch fit teacher = so epoch distill student.
-  - Student  : ViT-Base/16 (timm, KHONG pretrained -- random init) + BLL,
+  - Student  : ViT-Small/16 (timm, KHONG pretrained -- random init) + BLL,
                distill tu dau bang ELBO + GW structural loss.
   - Train set       : CIFAR-100 (num_labels = 100), anh duoc UPSIZE tu
                        32x32 len 224x224 (img_size) de khop input cua
-                       ViT-Large/Base patch16/224.
+                       ViT-Large/Small patch16/224.
   - Eval (in-dist)  : CIFAR-100 test split.
   - OOD test        : CIFAR-10 (AUROC / OOD detection, KHONG dung de train).
 
@@ -71,7 +71,6 @@ import warnings
 from dataclasses import dataclass
 from typing import List, Tuple, Dict, Optional
 from pathlib import Path
-from matplotlib.colors import LogNorm
 
 import numpy as np
 import torch
@@ -120,7 +119,7 @@ _DEFAULT_CIFAR100_DIR = os.path.join(_DEFAULT_DATASET_ROOT, "cifar-100")
 class Config:
     # ── Models (ViT, qua timm.create_model) ─────────────────────────────
     teacher_name: str = "vit_large_patch16_224"
-    student_name: str = "vit_base_patch16_224"
+    student_name: str = "vit_small_patch16_224"
     teacher_pretrained: bool = True     # teacher: load checkpoint pretrained (ImageNet)
     student_pretrained: bool = False    # student: distill tu dau (random init)
     img_size: int = 224                 # upsize CIFAR (32x32) len 224x224 -- input chuan cua patch16/224
@@ -241,7 +240,7 @@ CFG = Config()
 CFG.teacher_num_epochs = CFG.student_num_epochs
 
 TEACHER_KEY = "ViT-Large (teacher, BLL)"
-STUDENT_KEY = "ViT-Base (student, BLL+GW)"
+STUDENT_KEY = "ViT-Small (student, BLL+GW)"
 
 _CMAP_100 = plt.get_cmap("tab20")
 
@@ -525,8 +524,8 @@ class BLLViTClassifier(nn.Module):
     ViT backbone (timm, deterministic) + Bayesian Last Layer head.
     timm.create_model(..., num_classes=0) tra ve model voi `forward()` da
     cho ra dac trung sau pooling (CLS token / global pool), shape
-    [B, embed_dim] (1024 cho vit_large_patch16_224, 768 cho
-    vit_base_patch16_224, lay tu backbone.num_features), dung truc tiep
+    [B, embed_dim] (1024 cho vit_large_patch16_224, 384 cho
+    vit_small_patch16_224, lay tu backbone.num_features), dung truc tiep
     lam input h cho BLL head.
     """
     def __init__(self, backbone: nn.Module, head: BayesianLastLayer):
@@ -1220,12 +1219,12 @@ def fit_teacher(cfg: Config) -> Tuple[str, List[Dict]]:
 
 
 # =========================================================================
-# STAGE 2: STUDENT DISTILLATION  (ViT-Base, random init, single-input GW)
+# STAGE 2: STUDENT DISTILLATION  (ViT-Small, random init, single-input GW)
 # =========================================================================
 
 def distill_student(cfg: Config, teacher_ckpt_path: str, teacher_model_for_umap: BLLViTClassifier
                     ) -> Tuple[str, List[Dict]]:
-    """Student = ViT-Base KHONG pretrained (distill tu dau). 3-phase
+    """Student = ViT-Small KHONG pretrained (distill tu dau). 3-phase
     schedule + ELBO + GW single-input, giong logic ban CNN."""
     print(f"\n{'='*80}\nSTAGE 2: DISTILLING STUDENT -- {cfg.student_name}\n{'='*80}")
 
@@ -1274,7 +1273,7 @@ def distill_student(cfg: Config, teacher_ckpt_path: str, teacher_model_for_umap:
     history: List[Dict] = []
     student.train()
     global_step      = 0
-    latest_ckpt_path = os.path.join(cfg.checkpoint_dir, "student_vit_base_bll_gw_latest")
+    latest_ckpt_path = os.path.join(cfg.checkpoint_dir, "student_vit_small_bll_gw_latest")
 
     epoch_pbar = tqdm(range(1, cfg.student_num_epochs + 1), desc="student (BLL+GW) epochs", unit="epoch")
     for epoch in epoch_pbar:
@@ -1392,7 +1391,7 @@ def distill_student(cfg: Config, teacher_ckpt_path: str, teacher_model_for_umap:
               f"  sigma_mean={s['sigma_mean']:.4f}")
         student.train()
 
-    ckpt_path = os.path.join(cfg.checkpoint_dir, "student_vit_base_bll_gw")
+    ckpt_path = os.path.join(cfg.checkpoint_dir, "student_vit_small_bll_gw")
     save_bll_checkpoint(student, cfg, ckpt_path)
 
     del student, teacher, teacher_model_for_umap, optimizer, scheduler
@@ -1531,47 +1530,41 @@ def _clip_for_display(lg: np.ndarray, low_pct: float = 1.0, high_pct: float = 90
     return np.clip(lg, lo, hi)
 
 
-def _safe_lognorm(lg_clipped: np.ndarray) -> LogNorm:
-    """LogNorm an toan (vmin > 0), dich nhe neu co gia tri <= 0."""
-    vmin = float(lg_clipped.min())
-    vmax = float(lg_clipped.max())
-    if vmin <= 0:
-        eps = max(1e-8, 1e-6 * (vmax if vmax > 0 else 1.0))
-        vmin = eps
-        lg_clipped = lg_clipped + eps
-        vmax = float(lg_clipped.max())
-    if vmax <= vmin:
-        vmax = vmin * 10.0
-    return LogNorm(vmin=vmin, vmax=vmax)
-
-
 def _draw_3d_axis(ax, A, B, lg, key, fig, style: PlotStyle):
-    """Mau theo thang LOG; truc Z van la gia tri loss da clip (khong log)."""
-    norm = _safe_lognorm(lg)
+    """Mau va truc Z deu theo thang LINEAR (gia tri loss da clip)."""
+    vmin = float(lg.min())
+    vmax = float(lg.max())
+    if vmax <= vmin:
+        vmax = vmin + 1.0
+    norm = plt.Normalize(vmin=vmin, vmax=vmax)
     facecolors = plt.get_cmap(style.cmap_name)(norm(lg))
     surf = ax.plot_surface(A, B, lg, facecolors=facecolors, linewidth=0,
                            antialiased=True, edgecolor="none", shade=False)
-    ax.set_title(f"{key} -- 3D (color: log scale)", fontsize=style.subtitle_fontsize)
+    ax.set_title(f"{key} -- 3D (linear scale)", fontsize=style.subtitle_fontsize)
     ax.set_xlabel("alpha", fontsize=style.label_fontsize)
     ax.set_ylabel("beta", fontsize=style.label_fontsize)
     ax.set_zlabel("loss (clipped)", fontsize=style.label_fontsize)
     mappable = plt.cm.ScalarMappable(norm=norm, cmap=style.cmap_name)
     mappable.set_array(lg)
-    fig.colorbar(mappable, ax=ax, shrink=0.6, pad=0.1, label="loss (log scale)")
+    fig.colorbar(mappable, ax=ax, shrink=0.6, pad=0.1, label="loss")
 
 
 def _draw_2d_axis(ax, A, B, lg, key, fig, style: PlotStyle):
-    """Contour 2D voi thang mau LOG de phan giai vung day phang quanh theta*."""
-    norm = _safe_lognorm(lg)
-    levels = np.geomspace(norm.vmin, norm.vmax, 20)
+    """Contour 2D voi thang mau LINEAR de phan giai vung day phang quanh theta*."""
+    vmin = float(lg.min())
+    vmax = float(lg.max())
+    if vmax <= vmin:
+        vmax = vmin + 1.0
+    norm = plt.Normalize(vmin=vmin, vmax=vmax)
+    levels = np.linspace(vmin, vmax, 20)
     cs = ax.contourf(A, B, lg, levels=levels, cmap=style.cmap_name, norm=norm)
     ax.contour(A, B, lg, levels=levels, colors="k", linewidths=0.3, alpha=0.4)
-    ax.set_title(f"{key} -- 2D (color: log scale)", fontsize=style.subtitle_fontsize)
+    ax.set_title(f"{key} -- 2D (linear scale)", fontsize=style.subtitle_fontsize)
     ax.set_xlabel("alpha", fontsize=style.label_fontsize)
     ax.set_ylabel("beta", fontsize=style.label_fontsize)
     ax.scatter([0], [0], color="red", marker="*", s=150, label="theta* (posterior mean)")
     ax.legend(loc="upper right", fontsize=style.legend_fontsize)
-    fig.colorbar(cs, ax=ax, shrink=0.9, label="loss (log scale)")
+    fig.colorbar(cs, ax=ax, shrink=0.9, label="loss")
 
 
 def plot_landscapes_all(data: dict, cfg: Config, title: str, save_name_prefix: str,
@@ -1638,7 +1631,7 @@ def plot_metric_curves(history: dict, cfg: Config, style: PlotStyle = DEFAULT_ST
 
     for key, label, color in [
         (history.get("teacher_key", TEACHER_KEY), "ViT-Large teacher (BLL)", style.teacher_color),
-        (history.get("student_key", STUDENT_KEY), "ViT-Base student (BLL+GW)", style.student_color),
+        (history.get("student_key", STUDENT_KEY), "ViT-Small student (BLL+GW)", style.student_color),
     ]:
         rows = history.get("teacher_history" if "teacher" in key.lower() else "student_history", [])
         if not rows:
@@ -1672,7 +1665,7 @@ def plot_metric_curves(history: dict, cfg: Config, style: PlotStyle = DEFAULT_ST
         ax.tick_params(labelsize=style.tick_fontsize)
         ax.grid(alpha=style.grid_alpha)
         ax.legend(fontsize=style.legend_fontsize, loc="lower right")
-    fig.suptitle("CIFAR-100 Classification: BLL Teacher (ViT-Large) vs BLL+GW Student (ViT-Base)",
+    fig.suptitle("CIFAR-100 Classification: BLL Teacher (ViT-Large) vs BLL+GW Student (ViT-Small)",
                 fontsize=style.title_fontsize, fontweight="bold")
     fig.tight_layout(rect=[0, 0, 1, 0.92])
     p = os.path.join(cfg.figure_dir, "accuracy_f1_vs_epoch.png")
@@ -1699,7 +1692,7 @@ def plot_loss_curves(history: dict, cfg: Config, style: PlotStyle = DEFAULT_STYL
         plotted_any = False
         for label, color, rows in [
             ("ViT-Large teacher (BLL)", style.teacher_color, teacher_rows),
-            ("ViT-Base student (BLL+GW)", style.student_color, student_rows),
+            ("ViT-Small student (BLL+GW)", style.student_color, student_rows),
         ]:
             sub = [r for r in rows if field in r]
             if not sub:
@@ -1720,7 +1713,7 @@ def plot_loss_curves(history: dict, cfg: Config, style: PlotStyle = DEFAULT_STYL
             ax.text(0.5, 0.5, "no data", ha="center", va="center",
                    transform=ax.transAxes, fontsize=style.label_fontsize, color="gray")
 
-    fig.suptitle("Loss Components vs Epoch: BLL Teacher (ViT-Large) vs BLL+GW Student (ViT-Base)",
+    fig.suptitle("Loss Components vs Epoch: BLL Teacher (ViT-Large) vs BLL+GW Student (ViT-Small)",
                 fontsize=style.title_fontsize, fontweight="bold")
     fig.tight_layout(rect=[0, 0, 1, 0.95])
     p = os.path.join(cfg.figure_dir, "loss_curves.png")
@@ -1764,7 +1757,7 @@ def plot_ood_eval(payload: dict, cfg: Config, style: PlotStyle = DEFAULT_STYLE):
     fig, axes = plt.subplots(1, 2, figsize=style.figsize_wide)
     for ax, prefix, label, color in [
         (axes[0], "vit_large", "ViT-Large teacher (BLL)", style.teacher_color),
-        (axes[1], "vit_base", "ViT-Base student (BLL+GW)", style.student_color),
+        (axes[1], "vit_small", "ViT-Small student (BLL+GW)", style.student_color),
     ]:
         id_scores  = payload.get(f"{prefix}_id_scores")
         ood_scores = payload.get(f"{prefix}_ood_scores")
@@ -1873,7 +1866,7 @@ def main():
                   f"({CFG.teacher_num_epochs} epochs, = student_num_epochs) <<<")
             teacher_ckpt_path, teacher_history = fit_teacher(CFG)
 
-    student_ckpt_path = os.path.join(CFG.checkpoint_dir, "student_vit_base_bll_gw")
+    student_ckpt_path = os.path.join(CFG.checkpoint_dir, "student_vit_small_bll_gw")
     student_history: List[Dict] = []
 
     if CFG.run_distillation:
