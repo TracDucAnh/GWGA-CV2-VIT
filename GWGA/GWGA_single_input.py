@@ -91,6 +91,7 @@ import random
 import warnings
 from dataclasses import dataclass
 from typing import List, Tuple, Dict, Optional
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -258,12 +259,22 @@ class Config:
     # cao hon = bat dinh hon = nhieu kha nang la OOD.
     ood_score_type: str = "predictive_entropy"
 
-    # ── Output ────────────────────────────────────────────────────────────
-    output_dir: str = "../output_resnet_cifar_bll_gw"
-    checkpoint_dir: str = "../output_resnet_cifar_bll_gw/checkpoints"
-    figure_dir: str = "../output_resnet_cifar_bll_gw/figures"
-    figure_data_dir: str = "../output_resnet_cifar_bll_gw/figure_data"  # .npz/.json tho
-    log_file: str = "../output_resnet_cifar_bll_gw/train_log.jsonl"
+    current_dir = Path(__file__).resolve().parent
+
+    base_output_dir = current_dir / "output_resnet_cifar_bll_gw_single_input"
+
+    # 3. Ghép các đường dẫn
+    output_dir = str(base_output_dir)
+    checkpoint_dir = str(base_output_dir / "checkpoints")
+    figure_dir = str(base_output_dir / "figures")
+    figure_data_dir = str(base_output_dir / "figure_data")
+    log_file = str(base_output_dir / "train_log.jsonl")
+
+    # 4. (Khuyên dùng) Tự động tạo thư mục nếu chưa tồn tại
+    base_output_dir.mkdir(parents=True, exist_ok=True)
+    Path(checkpoint_dir).mkdir(exist_ok=True)
+    Path(figure_dir).mkdir(exist_ok=True)
+    Path(figure_data_dir).mkdir(exist_ok=True)
 
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     seed: int = 1234
