@@ -1460,19 +1460,27 @@ def evaluate_classification_loss(model: BLLViTClassifier, loader, device, dtype,
     return total_loss / max(1, n_batches)
 
 
-def compute_loss_landscape(model: BLLViTClassifier, loader, cfg: Config, seed=0):
-    """Quet loss landscape tren luoi (alpha, beta) trong
-    [cfg.landscape_alpha_range] x [cfg.landscape_beta_range] (mac dinh [-2,2])."""
+def compute_loss_landscape(model: BLLViTClassifier, loader, cfg: Config, seed=0, raw_dirs=None):
     device = cfg.device
     grid   = cfg.landscape_grid_size
     torch.manual_seed(seed)
-    named       = list(model.landscape_named_parameters())  # da loai log_sigma
+    named       = list(model.landscape_named_parameters())
     params      = [p for _, p in named]
     base_params = [p.detach().clone() for p in params]
-    dir1 = get_random_direction_like(params)
-    dir2 = get_random_direction_like(params)
+
+    # Sử dụng explicit directions từ shared_dirs nếu có
+    if raw_dirs is not None:
+        raw_dir1, raw_dir2 = raw_dirs
+        # CLONE trước khi normalize để không làm hỏng raw_dirs dùng chung cho phase sau
+        dir1 = [d.clone().to(p.device) for d, p in zip(raw_dir1, params)]
+        dir2 = [d.clone().to(p.device) for d, p in zip(raw_dir2, params)]
+    else:
+        dir1 = get_random_direction_like(params)
+        dir2 = get_random_direction_like(params)
+
     filter_normalize_direction(dir1, base_params)
     filter_normalize_direction(dir2, base_params)
+
     alphas    = np.linspace(cfg.landscape_alpha_range[0], cfg.landscape_alpha_range[1], grid)
     betas     = np.linspace(cfg.landscape_beta_range[0],  cfg.landscape_beta_range[1],  grid)
     loss_grid = np.zeros((grid, grid), dtype=np.float64)
@@ -1495,18 +1503,17 @@ def compute_loss_landscape(model: BLLViTClassifier, loader, cfg: Config, seed=0)
 
 # ── Loss landscape: tach tinh toan / luu du lieu / ve, de "de ve lai" ────
 
-def compute_landscape_data(teacher_model, student_model, cfg: Config, tag: str) -> dict:
-    """Quet loss landscape cho ca teacher va student, tra ve dict de luu/ve."""
+def compute_landscape_data(teacher_model, student_model, cfg: Config, tag: str, shared_dirs: dict = None) -> dict:
     landscape_loader = build_landscape_loader(cfg)
     results = {}
     for key, model in [(TEACHER_KEY, teacher_model), (STUDENT_KEY, student_model)]:
         model.to(cfg.device)
+        raw_dirs = shared_dirs[key] if shared_dirs and key in shared_dirs else None
         print(f"\n[landscape:{tag}] Sweeping {cfg.landscape_grid_size}x{cfg.landscape_grid_size} for {key} ...")
         alphas, betas, loss_grid = compute_loss_landscape(
-            model, landscape_loader, cfg, seed=cfg.landscape_seed)
+            model, landscape_loader, cfg, seed=cfg.landscape_seed, raw_dirs=raw_dirs)
         results[key] = {"alphas": alphas, "betas": betas, "loss_grid": loss_grid}
     return {"tag": tag, "results": results}
-
 
 def save_landscape_data(cfg: Config, data: dict):
     tag = data["tag"]
@@ -1530,12 +1537,8 @@ def _clip_for_display(lg: np.ndarray, low_pct: float = 1.0, high_pct: float = 90
     return np.clip(lg, lo, hi)
 
 
-def _draw_3d_axis(ax, A, B, lg, key, fig, style: PlotStyle):
-    """Mau va truc Z deu theo thang LINEAR (gia tri loss da clip)."""
-    vmin = float(lg.min())
-    vmax = float(lg.max())
-    if vmax <= vmin:
-        vmax = vmin + 1.0
+def _draw_3d_axis(ax, A, B, lg, key, fig, style: PlotStyle, vmin: float, vmax: float):
+    """Mau va truc Z deu theo thang LINEAR (gia tri loss KHONG clip)."""
     norm = plt.Normalize(vmin=vmin, vmax=vmax)
     facecolors = plt.get_cmap(style.cmap_name)(norm(lg))
     surf = ax.plot_surface(A, B, lg, facecolors=facecolors, linewidth=0,
@@ -1543,18 +1546,14 @@ def _draw_3d_axis(ax, A, B, lg, key, fig, style: PlotStyle):
     ax.set_title(f"{key} -- 3D (linear scale)", fontsize=style.subtitle_fontsize)
     ax.set_xlabel("alpha", fontsize=style.label_fontsize)
     ax.set_ylabel("beta", fontsize=style.label_fontsize)
-    ax.set_zlabel("loss (clipped)", fontsize=style.label_fontsize)
+    ax.set_zlabel("loss", fontsize=style.label_fontsize)
     mappable = plt.cm.ScalarMappable(norm=norm, cmap=style.cmap_name)
     mappable.set_array(lg)
     fig.colorbar(mappable, ax=ax, shrink=0.6, pad=0.1, label="loss")
 
 
-def _draw_2d_axis(ax, A, B, lg, key, fig, style: PlotStyle):
-    """Contour 2D voi thang mau LINEAR de phan giai vung day phang quanh theta*."""
-    vmin = float(lg.min())
-    vmax = float(lg.max())
-    if vmax <= vmin:
-        vmax = vmin + 1.0
+def _draw_2d_axis(ax, A, B, lg, key, fig, style: PlotStyle, vmin: float, vmax: float):
+    """Contour 2D voi thang mau LINEAR, su dung vmin, vmax chung."""
     norm = plt.Normalize(vmin=vmin, vmax=vmax)
     levels = np.linspace(vmin, vmax, 20)
     cs = ax.contourf(A, B, lg, levels=levels, cmap=style.cmap_name, norm=norm)
@@ -1569,10 +1568,17 @@ def _draw_2d_axis(ax, A, B, lg, key, fig, style: PlotStyle):
 
 def plot_landscapes_all(data: dict, cfg: Config, title: str, save_name_prefix: str,
                         style: PlotStyle = DEFAULT_STYLE):
-    """Ve tu du lieu landscape da tinh san (data tu compute_landscape_data hoac load_figure_data)."""
+    """Ve tu du lieu landscape da tinh san, dung CHUNG thang do heatmap (vmin, vmax)."""
     results = data["results"]
     keys = list(results.keys())
     n    = len(keys)
+    
+    # Tính vmin, vmax chung cho toàn bộ grids để đồng bộ thang đo màu
+    global_vmin = min([float(r["loss_grid"].min()) for r in results.values()])
+    global_vmax = max([float(r["loss_grid"].max()) for r in results.values()])
+    if global_vmax <= global_vmin:
+        global_vmax = global_vmin + 1.0
+
     for suffix, rows_spec in [("_3d_1x2.png", [["3d"]]), ("_2d_1x2.png", [["2d"]]),
                               ("_2x2.png", [["3d"], ["2d"]])]:
         fig = plt.figure(figsize=(style.figsize_single[0]*n, style.figsize_single[1]*len(rows_spec)))
@@ -1582,14 +1588,13 @@ def plot_landscapes_all(data: dict, cfg: Config, title: str, save_name_prefix: s
                 rdata = results[key]
                 alphas, betas, lg = rdata["alphas"], rdata["betas"], rdata["loss_grid"]
                 A, B = np.meshgrid(alphas, betas, indexing="ij")
-                lgc  = _clip_for_display(lg)
                 idx  = r * n + c + 1
                 if mode == "3d":
                     ax = fig.add_subplot(len(rows_spec), n, idx, projection="3d")
-                    _draw_3d_axis(ax, A, B, lgc, key, fig, style)
+                    _draw_3d_axis(ax, A, B, lg, key, fig, style, global_vmin, global_vmax)
                 else:
                     ax = fig.add_subplot(len(rows_spec), n, idx)
-                    _draw_2d_axis(ax, A, B, lgc, key, fig, style)
+                    _draw_2d_axis(ax, A, B, lg, key, fig, style, global_vmin, global_vmax)
         fig.suptitle(title, fontsize=style.title_fontsize, fontweight="bold")
         fig.tight_layout(rect=[0, 0, 1, 0.95])
         p = os.path.join(cfg.figure_dir, save_name_prefix + suffix)
@@ -1600,8 +1605,9 @@ def plot_landscapes_all(data: dict, cfg: Config, title: str, save_name_prefix: s
 
 
 def run_landscape_and_plot(teacher_model, student_model, cfg: Config, tag: str,
-                           title: str, save_name_prefix: str, style: PlotStyle = DEFAULT_STYLE):
-    data = compute_landscape_data(teacher_model, student_model, cfg, tag)
+                           title: str, save_name_prefix: str, shared_dirs: dict = None,
+                           style: PlotStyle = DEFAULT_STYLE):
+    data = compute_landscape_data(teacher_model, student_model, cfg, tag, shared_dirs)
     save_landscape_data(cfg, data)
     plot_landscapes_all(data, cfg, title=title, save_name_prefix=save_name_prefix, style=style)
     return data
@@ -1838,6 +1844,27 @@ def main():
     print(f"Teacher epochs == Student epochs (yeu cau): "
           f"{CFG.teacher_num_epochs} == {CFG.student_num_epochs}")
 
+    # ============================================================
+    # TẠO GLOBAL SHARED DIRECTIONS ĐỂ ĐẢM BẢO BEFORE/AFTER CÙNG DIRECTION
+    # ============================================================
+    shared_dirs = {}
+    if CFG.run_pre_landscape or CFG.run_post_landscape:
+        print("\n>>> Generating fixed random directions for landscape (Before & After) <<<")
+        torch.manual_seed(CFG.landscape_seed)
+        t_dummy = BLLViTClassifier.from_timm_name(CFG.teacher_name, CFG.num_labels, False, CFG.prior_std, CFG.init_log_sigma)
+        s_dummy = BLLViTClassifier.from_timm_name(CFG.student_name, CFG.num_labels, False, CFG.prior_std, CFG.init_log_sigma)
+        
+        shared_dirs[TEACHER_KEY] = (
+            get_random_direction_like([p for _, p in t_dummy.landscape_named_parameters()]),
+            get_random_direction_like([p for _, p in t_dummy.landscape_named_parameters()])
+        )
+        shared_dirs[STUDENT_KEY] = (
+            get_random_direction_like([p for _, p in s_dummy.landscape_named_parameters()]),
+            get_random_direction_like([p for _, p in s_dummy.landscape_named_parameters()])
+        )
+        del t_dummy, s_dummy
+    # ============================================================
+
     teacher_ckpt_path = os.path.join(CFG.checkpoint_dir, "teacher_vit_large_bll")
     teacher_history: List[Dict] = []
 
@@ -1856,6 +1883,7 @@ def main():
                 t_fresh, s_fresh, CFG, tag="BEFORE",
                 title="Loss Landscape BEFORE Knowledge Distillation",
                 save_name_prefix="loss_landscape_BEFORE_distillation",
+                shared_dirs=shared_dirs, # <--- TRUYỀN DIR VÀO ĐÂY
             )
             del t_fresh, s_fresh
             if torch.cuda.is_available():
@@ -1893,6 +1921,7 @@ def main():
             teacher_model, student_model, CFG, tag="AFTER",
             title="Loss Landscape AFTER Knowledge Distillation",
             save_name_prefix="loss_landscape_AFTER_distillation",
+            shared_dirs=shared_dirs, # <--- TRUYỀN DIR VÀO ĐÂY
         )
 
         if CFG.run_ood_eval:
