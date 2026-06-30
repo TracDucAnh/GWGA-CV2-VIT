@@ -1,63 +1,47 @@
 """
-GWGA_single_input.py  (CNN / CV-2 setup)
+GWGA_single_input_vit.py  (ViT setup)
 =====================================
 Gromov-Wasserstein Alignment of Bayesian Last-Layer Posteriors
 (Structural Knowledge Distillation) -- SINGLE-INPUT variant (Algorithm 1
 trong paper, KHONG phai Algorithm 2 batch-pooled).
 
-Kien truc & du lieu -- CNN, giong setup "CV-2 (lightweight classification)"
-trong paper Sec 6.2 ("Larger -> smaller convolutional network. Metrics:
-accuracy, ECE, and Hessian-trace sharpness, used specifically to test the
-necessary-condition gap of Proposition 5.3."):
-  - Teacher  : ResNet-50 (torchvision, pretrained ImageNet) + Bayesian Last
-               Layer (BLL). Backbone pretrained duoc GIU/finetune nhe, chi
-               co BLL head la thanh phan Bayesian moi duoc fit. So epoch fit
-               teacher = so epoch distill student (student_num_epochs).
-  - Student  : ResNet-18 (torchvision, KHONG pretrained -- random init) +
-               BLL, distill tu dau bang ELBO + GW structural loss.
-  - Train set       : CIFAR-100 (num_labels = 100).
+Kien truc & du lieu -- Vision Transformer, gan voi tinh than setup "CV-1
+(large-scale classification): Large -> small vision transformer" trong
+paper Sec 6.2, nhung GIU LAI bo metric cua CV-2 (accuracy, ECE,
+Hessian-trace sharpness) vi van muon do necessary-condition gap cua
+Proposition 5.3:
+  - Teacher  : ViT-Large/16 (timm, pretrained ImageNet) + Bayesian Last
+               Layer (BLL). Backbone pretrained co the duoc finetune nhe
+               hoac freeze; chi BLL head la thanh phan Bayesian moi.
+               So epoch fit teacher = so epoch distill student.
+  - Student  : ViT-Base/16 (timm, KHONG pretrained -- random init) + BLL,
+               distill tu dau bang ELBO + GW structural loss.
+  - Train set       : CIFAR-100 (num_labels = 100), anh duoc UPSIZE tu
+                       32x32 len 224x224 (img_size) de khop input cua
+                       ViT-Large/Base patch16/224.
   - Eval (in-dist)  : CIFAR-100 test split.
-  - OOD test        : CIFAR-10 (dung de danh gia AUROC/OOD detection theo
-                       tinh than benchmark suite Sec. 6.2/6.5 cua paper --
-                       KHONG dung de train).
+  - OOD test        : CIFAR-10 (AUROC / OOD detection, KHONG dung de train).
 
-Single-input GW (Algorithm 1, paper Sec 3.4 / Algorithm 1):
-  - Voi MOI sample trong batch, sample K particles tu posterior cua
-    teacher/student tai INPUT DO, dung K dap so do de xay cost matrix
-    C in R^{K x K} (pairwise distance giua K particles CUA CUNG MOT INPUT).
-  - GW duoc giai DOC LAP cho tung sample trong batch (vector hoa qua batch
-    dim B), KHONG gop nhieu input lai thanh 1 cost matrix (nK)x(nK) nhu
-    Algorithm 2 (batch-pooled) -- vi vay file nay duoc dat ten "single_input".
+Single-input GW (Algorithm 1): voi MOI sample trong batch, sample K
+particles tu posterior cua teacher/student tai INPUT DO, dung K dap so do
+de xay cost matrix C in R^{KxK} (pairwise distance giua K particles CUA
+CUNG MOT INPUT). GW duoc giai DOC LAP cho tung sample, vector hoa qua
+batch dim B (khac Algorithm 2 batch-pooled, gop (nK)x(nK)).
 
-QUAN TRONG -- BatchNorm va loss landscape (CNN khac ViT o diem nay):
-  ResNet dung BatchNorm2d, co 2 loai "trang thai" gan voi moi BN layer:
-    1. Affine parameters (weight=gamma, bias=beta): la nn.Parameter, NAM
-       TRONG named_parameters(), nhung la vector 1-D (1 gia tri / channel),
-       KHONG co cau truc "filter" nhu Conv2d.weight (out,in,kh,kw) -- filter
-       normalization (Li et al., 2018) chi co y nghia hinh hoc cho cac
-       tensor nhieu chieu (conv/linear weight), khong cho BN affine. Vi vay
-       o day BN affine bi LOAI KHOI random-direction / filter-normalize
-       (giu nguyen tai theta*, khong nhieu), GIONG CACH Li et al. xu ly,
-       thay vi chi dua vao dieu kien "dim() <= 1" nhu code ban GPT2/ViT cu
-       (dieu kien do tinh co zero-out BN affine, nhung khong tuong minh).
-    2. Running statistics (running_mean, running_var, num_batches_tracked):
-       la BUFFER, KHONG PHAI Parameter -- KHONG nam trong named_parameters(),
-       nen vong lap perturb theo (alpha, beta) o ban cu se "bo sot" chung.
-       He qua: sau khi cong nhieu vao trong so, running_mean/var cu (uoc
-       luong tai theta*) khong con khop voi phan bo activation moi nua ->
-       loss tinh duoc se SAI/nhieu vi BN dang chuan hoa theo thong ke cua
-       1 diem khac trong khong gian trong so.
-    -> Cach xu ly trong file nay: khi quet loss landscape, TAM THOI chuyen
-       moi BatchNorm2d sang `track_running_stats=False` (forward se dung
-       batch statistics TUC THOI cua chinh landscape-eval-batch, giong
-       het cach Li et al. xu ly trong paper goc cua ho), quet xong thi
-       KHOI PHUC lai track_running_stats=True va running_mean/var ban dau
-       (xem ham `_bn_recompute_stats_context`). Affine weight/bias cua BN
-       van duoc giu CO DINH (khong nam trong dir1/dir2) trong suot qua
-       trinh quet, dung nhu Conv/Linear bias va cac vector 1-D khac.
-
-Range quet landscape: alpha, beta in [-2, 2] (theo yeu cau, rong hon range
-[-1,1] mac dinh cua ban ViT truoc).
+So voi ban CNN/ResNet truoc -- diem khac biet quan trong:
+  ViT (timm) dung LayerNorm, KHONG dung BatchNorm. LayerNorm:
+    - KHONG co running statistics (buffer) nhu BatchNorm -- thong ke duoc
+      tinh TUC THOI tren chinh moi forward pass, bat ke dang train hay
+      eval. Vi vay loss landscape KHONG can bat ky context-manager dac
+      biet nao de "tam thoi chuyen sang dung batch statistics" nhu ban
+      CNN (xem _bn_use_batch_stats_context cu) -- van de do KHONG TON TAI
+      voi LayerNorm.
+    - Affine weight/bias cua LayerNorm la vector 1 chieu (1 gia tri/dim),
+      giong Conv/Linear bias -- da duoc dieu kien "d.dim() <= 1" trong
+      filter_normalize_direction() zero-out tu dong (xem Li et al., 2018),
+      nen KHONG can logic loai-tru rieng nhu BN affine o ban CNN.
+  -> Ket qua: landscape_named_parameters() va compute_loss_landscape()
+     don gian hon han ban CNN (khong can quet/khoi-phuc trang thai BN).
 
 Cac diem giu nguyen (logic khong doi, chi doi kien truc/domain):
   - 1 Config dataclass duy nhat.
@@ -66,17 +50,12 @@ Cac diem giu nguyen (logic khong doi, chi doi kien truc/domain):
   - UMAP duoc ve moi `umap_every_n_steps` cho CA teacher lan student trong
     luc distill (cung 1 probe batch co dinh xuyen suot training).
   - 3-phase schedule (task-only -> posterior -> structural) cho student.
-  - Cac record/log/jsonl giu nguyen tinh than (epoch, loss terms, sigma...).
-
-Diem moi quan trong - "de ve lai nhieu lan":
-  - MOI figure quan trong (loss landscape, metric curves, loss curves,
-    OOD/AUROC, UMAP) deu luu kem du lieu tho (.npz / .json) CANH file .png,
-    va phan ve duoc tach rieng thanh ham `plot_xxx(data, style)` nhan vao
-    1 `PlotStyle` dataclass (figsize, fontsize, dpi, colors...) de nguoi
-    dung co the doc lai du lieu va ve lai voi style khac MA KHONG can
-    tinh toan lai (khong can forward model / GPU).
-  - Co san script con `replot_from_saved(...)` o cuoi file de minh hoa
-    cach load lai .npz/.json va goi lai ham plot_xxx voi PlotStyle moi.
+  - ECE, Hessian-trace sharpness (Hutchinson estimator), OOD AUROC
+    (CIFAR-100 ID vs CIFAR-10 OOD) deu giu nguyen.
+  - Moi figure quan trong deu luu kem du lieu tho (.npz/.json) canh file
+    .png, va phan ve duoc tach rieng thanh plot_xxx(data, style) de co the
+    doc lai va ve lai voi style khac ma khong can tinh toan lai
+    (replot_all_from_saved() o cuoi file).
 """
 
 import os
@@ -108,9 +87,8 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 
-import torchvision
+import timm
 import torchvision.transforms as T
-import torchvision.models as tvm
 from PIL import Image
 
 warnings.filterwarnings("ignore")
@@ -120,19 +98,13 @@ warnings.filterwarnings("ignore")
 # DATASET PATHS (du lieu DA TAI VE SAN, nam trong thu muc `dataset/` o
 # project root -- KHONG bao gio tai lai/download trong code train).
 # =========================================================================
-# Cay thu muc thuc te (xem screenshot project):
-#   GWGA-CV2-VIT/
+#   GWGA-CV1-VIT/
 #     dataset/
 #       cifar-10/   {train,test}_images.npy, {train,test}_labels.npy, classes.txt
 #       cifar-100/  {train,test}_images.npy, {train,test}_labels.npy,
 #                   {train,test}_coarse_labels.npy, fine_classes.txt, coarse_classes.txt
 #     GWGA/
-#       GWGA_single_input.py   <-- file nay
-#
-# Duong dan duoc tinh TUONG DOI theo vi tri cua chinh file nay (__file__),
-# KHONG phu thuoc cwd luc chay script -> luon tro dung "../dataset" du
-# script duoc goi tu dau (vd `python GWGA/GWGA_single_input.py` tu root,
-# hay `python GWGA_single_input.py` tu trong thu muc GWGA/).
+#       GWGA_single_input_vit.py   <-- file nay
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 _PROJECT_ROOT = os.path.dirname(_THIS_DIR)
 _DEFAULT_DATASET_ROOT = os.path.join(_PROJECT_ROOT, "dataset")
@@ -146,37 +118,32 @@ _DEFAULT_CIFAR100_DIR = os.path.join(_DEFAULT_DATASET_ROOT, "cifar-100")
 
 @dataclass
 class Config:
-    # ── Models (CNN, qua torchvision.models -- setup "CV-2" trong paper) ──
-    teacher_name: str = "resnet50"
-    student_name: str = "resnet18"
+    # ── Models (ViT, qua timm.create_model) ─────────────────────────────
+    teacher_name: str = "vit_large_patch16_224"
+    student_name: str = "vit_base_patch16_224"
     teacher_pretrained: bool = True     # teacher: load checkpoint pretrained (ImageNet)
     student_pretrained: bool = False    # student: distill tu dau (random init)
-    img_size: int = 224                 # resize CIFAR len input size chuan cua ResNet/ImageNet
+    img_size: int = 224                 # upsize CIFAR (32x32) len 224x224 -- input chuan cua patch16/224
 
     # ── Data ──────────────────────────────────────────────────────────────
     # Train + eval-in-distribution: CIFAR-100. OOD test: CIFAR-10.
-    # QUAN TRONG: du lieu DA duoc tai ve san duoi dang .npy trong thu muc
-    # `dataset/cifar-10` va `dataset/cifar-100` (xem _DEFAULT_CIFAR10_DIR /
-    # _DEFAULT_CIFAR100_DIR o dau file). KHONG dung torchvision.datasets
-    # voi download=True o bat ky dau trong file nay -- xem NpyImageDataset
-    # va cac ham build_*_loader(s) ben duoi, tat ca deu doc thang tu .npy
-    # tren dia, khong bao gio goi mang.
+    # Du lieu DA duoc tai ve san duoi dang .npy trong dataset/cifar-10 va
+    # dataset/cifar-100 -- KHONG download=True o bat ky dau (xem
+    # NpyImageDataset / build_*_loader(s) ben duoi).
     train_dataset: str = "cifar100"
     id_eval_dataset: str = "cifar100"
     ood_dataset: str = "cifar10"
     cifar10_dir: str = _DEFAULT_CIFAR10_DIR
     cifar100_dir: str = _DEFAULT_CIFAR100_DIR
-    num_labels: int = 100               # so class CIFAR-100
+    num_labels: int = 100
     num_workers: int = 4
 
     # ── Teacher fit (tren pretrained backbone) ───────────────────────────
-    # YEU CAU: so epoch fit teacher = so epoch distill student.
-    # -> teacher_num_epochs khong con la field doc lap, duoc gan = student_num_epochs
-    #    ngay sau khi tao CFG (xem ngay duoi class Config).
+    # YEU CAU: so epoch fit teacher = so epoch distill student -> gan o
+    # ngay sau khi tao CFG (xem duoi class Config).
     teacher_num_epochs: int = 10
     teacher_kl_beta_max: float = 1.0
     teacher_kl_warmup_frac: float = 0.1
-    # Backbone pretrained: co the finetune nhe (lr nho hon) hoac freeze hoan toan.
     teacher_finetune_backbone: bool = True
     teacher_backbone_lr_mult: float = 0.1   # backbone lr = learning_rate * mult
 
@@ -195,10 +162,10 @@ class Config:
     max_grad_norm: float = 1.0
     mixed_precision_dtype: torch.dtype = torch.bfloat16
 
-    batch_size: int = 128
-    distill_batch_size: int = 64
+    batch_size: int = 64
+    distill_batch_size: int = 32
     gradient_accumulation_steps: int = 1
-    use_gradient_checkpointing: bool = True
+    use_gradient_checkpointing: bool = True   # timm ViT ho tro set_grad_checkpointing()
 
     # ── Bayesian Last Layer ──────────────────────────────────────────────
     num_particles: int = 16
@@ -210,7 +177,6 @@ class Config:
     gw_epsilon: float = 0.1
     gw_sinkhorn_iters: int = 30
     gw_outer_iters: int = 10
-    # Distance dung de xay cost matrix C[i,j] = d(resp_i, resp_j)
     gw_distance: str = "sqeuclidean"     # "sqeuclidean" | "cosine"
 
     # ── UMAP probe ────────────────────────────────────────────────────────
@@ -224,54 +190,36 @@ class Config:
 
     # ── Loss landscape ───────────────────────────────────────────────────
     landscape_grid_size: int = 15
-    # YEU CAU: quet alpha, beta tu -2 den 2 (rong hon mac dinh [-1,1]).
     landscape_alpha_range: Tuple[float, float] = (-2.0, 2.0)
     landscape_beta_range: Tuple[float, float] = (-2.0, 2.0)
     landscape_eval_batches: int = 10
     landscape_eval_batch_size: int = 16
     landscape_seed: int = 42
-    # BatchNorm trong luc quet landscape: dung batch statistics TUC THOI
-    # (track_running_stats=False) thay vi running_mean/var co dinh tai
-    # theta*, vi running stats cu khong con khop sau khi trong so bi nhieu.
-    # Xem ghi chu lon o dau file va ham _bn_use_batch_stats_context().
-    landscape_bn_use_batch_stats: bool = True
+    # Khong can co flag/context-manager rieng cho LayerNorm nhu BatchNorm
+    # o ban CNN -- LayerNorm khong co running stats nen khong co van de
+    # "thong ke cu khong khop voi trong so moi" khi quet (alpha, beta).
 
     # ── ECE (Expected Calibration Error) ─────────────────────────────────
-    # Metric hieu chuan (calibration), Sec 6.2 cua paper: "accuracy, ECE,
-    # and Hessian-trace sharpness". Tinh tren posterior-predictive softmax
-    # (trung binh qua particle, giong cach tinh "accuracy") VA tren
-    # mean-forward softmax (giong "accuracy_mean"). Xem compute_ece().
     ece_num_bins: int = 15
 
     # ── Hessian-trace sharpness (necessary-condition gap, Proposition 5.3) ─
-    # Uoc luong Tr(H) cua CE loss (mean-forward, tai theta*) bang Hutchinson
-    # estimator (Rademacher random vectors + Hessian-vector products qua
-    # double backprop), giong PyHessian / Yao et al. 2020. Dung CHUNG bo
-    # eval-batch nho, co dinh voi loss landscape (build_landscape_loader)
-    # vi cung phuc vu muc dich do "do phang/sac" quanh theta* -- xem
-    # evaluate_hessian_trace_sharpness().
     hessian_num_hutchinson_samples: int = 10
-    hessian_eval_batches: int = 5      # so batch (tu landscape loader) dung de trung binh
+    hessian_eval_batches: int = 5
     hessian_seed: int = 777
 
     # ── OOD evaluation (CIFAR-10 dung lam OOD cho model train tren CIFAR-100) ─
     ood_num_particles: int = 16
-    # Diem so dung lam "OOD score": entropy cua posterior-predictive softmax,
-    # cao hon = bat dinh hon = nhieu kha nang la OOD.
     ood_score_type: str = "predictive_entropy"
 
     current_dir = Path(__file__).resolve().parent
+    base_output_dir = current_dir / "output_vit_cifar_bll_gw_single_input"
 
-    base_output_dir = current_dir / "output_resnet_cifar_bll_gw_single_input"
-
-    # 3. Ghép các đường dẫn
     output_dir = str(base_output_dir)
     checkpoint_dir = str(base_output_dir / "checkpoints")
     figure_dir = str(base_output_dir / "figures")
     figure_data_dir = str(base_output_dir / "figure_data")
     log_file = str(base_output_dir / "train_log.jsonl")
 
-    # 4. (Khuyên dùng) Tự động tạo thư mục nếu chưa tồn tại
     base_output_dir.mkdir(parents=True, exist_ok=True)
     Path(checkpoint_dir).mkdir(exist_ok=True)
     Path(figure_dir).mkdir(exist_ok=True)
@@ -292,10 +240,9 @@ CFG = Config()
 # YEU CAU 1: teacher duoc fit voi so epoch BANG so epoch distill student.
 CFG.teacher_num_epochs = CFG.student_num_epochs
 
-TEACHER_KEY = "ResNet-50 (teacher, BLL)"
-STUDENT_KEY = "ResNet-18 (student, BLL+GW)"
+TEACHER_KEY = "ViT-Large (teacher, BLL)"
+STUDENT_KEY = "ViT-Base (student, BLL+GW)"
 
-# CIFAR-100 co 100 class -> dung colormap thay vi list mau co dinh nhu IMDB (2 class).
 _CMAP_100 = plt.get_cmap("tab20")
 
 
@@ -316,12 +263,9 @@ def log_jsonl(path: str, record: dict):
 
 
 def save_figure_data(cfg: Config, name: str, payload: dict):
-    """
-    Luu du lieu tho dung de ve 1 figure, duoi dang .npz (cho mang so) cong
-    voi 1 file .json nho di kem (cho metadata khong phai mang). Muc dich:
-    cho phep goi lai plot_xxx(...) voi PlotStyle khac MA KHONG can tinh
-    toan lai (khong can GPU / khong can forward model).
-    """
+    """Luu du lieu tho dung de ve 1 figure (.npz cho mang so + .json cho
+    metadata), de co the goi lai plot_xxx(...) voi PlotStyle khac ma
+    khong can tinh toan lai (khong can GPU / khong can forward model)."""
     os.makedirs(cfg.figure_data_dir, exist_ok=True)
     arrays = {k: v for k, v in payload.items() if isinstance(v, np.ndarray)}
     meta   = {k: v for k, v in payload.items() if not isinstance(v, np.ndarray)}
@@ -331,7 +275,6 @@ def save_figure_data(cfg: Config, name: str, payload: dict):
 
 
 def load_figure_data(cfg: Config, name: str) -> dict:
-    """Doc lai du lieu da luu boi save_figure_data()."""
     arrays = dict(np.load(os.path.join(cfg.figure_data_dir, f"{name}.npz")))
     meta_path = os.path.join(cfg.figure_data_dir, f"{name}.meta.json")
     meta = {}
@@ -342,17 +285,11 @@ def load_figure_data(cfg: Config, name: str) -> dict:
 
 
 # =========================================================================
-# PLOT STYLE  (1 noi duy nhat de chinh size/font/mau khi ve lai)
+# PLOT STYLE
 # =========================================================================
 
 @dataclass
 class PlotStyle:
-    """
-    Tat ca tham so visual (khong phai du lieu) cho moi ham plot_xxx trong
-    file nay. Tao 1 PlotStyle moi va truyen vao plot_xxx(data, style) de
-    ve lai voi kich thuoc/font khac, KHONG dong cham gi den qua trinh
-    tinh toan/training.
-    """
     figsize_single: Tuple[float, float] = (8.0, 6.0)
     figsize_wide:   Tuple[float, float] = (14.0, 5.5)
     figsize_grid2x2: Tuple[float, float] = (14.0, 11.0)
@@ -392,11 +329,9 @@ def get_sigma_stats(model) -> dict:
 # DATA: CIFAR-100 (train/eval-in-dist) + CIFAR-10 (OOD)
 # =========================================================================
 
-def build_cnn_transforms(cfg: Config, train: bool) -> T.Compose:
-    """
-    Resize CIFAR (32x32) len img_size (mac dinh 224) cho ResNet, normalize
-    theo thong ke ImageNet (chuan khi dung backbone pretrained cua torchvision).
-    """
+def build_image_transforms(cfg: Config, train: bool) -> T.Compose:
+    """Upsize CIFAR (32x32) len img_size (224, mac dinh) cho ViT, normalize
+    theo thong ke ImageNet (chuan khi dung backbone pretrained cua timm)."""
     ops = [T.Resize((cfg.img_size, cfg.img_size))]
     if train:
         ops += [T.RandomHorizontalFlip(p=0.5)]
@@ -410,16 +345,14 @@ def build_cnn_transforms(cfg: Config, train: bool) -> T.Compose:
 class NpyImageDataset(Dataset):
     """
     Dataset CIFAR-10/100 doc TRUC TIEP tu cac file .npy DA CO SAN tren dia
-    (dataset/cifar-10/ hoac dataset/cifar-100/), thay cho
-    torchvision.datasets.CIFARxx(..., download=True). KHONG bao gio goi
-    mang -- neu thieu file se bao loi ro rang (FileNotFoundError) thay vi
-    tu dong tai ve.
+    (dataset/cifar-10/ hoac dataset/cifar-100/). KHONG bao gio goi mang --
+    neu thieu file se bao loi ro rang (FileNotFoundError) thay vi tu dong
+    tai ve.
 
-    Gia dinh format (dung chuan khi dump tu torchvision.datasets.CIFARxx,
-    vd `np.save(path, dataset.data)`):
-      - images_path : uint8, shape [N, 32, 32, 3] (HWC, RGB). Neu phat hien
-                      shape kieu [N, 3, 32, 32] (CHW), tu dong chuyen ve
-                      HWC de Image.fromarray() hoat dong dung.
+    Gia dinh format (chuan khi dump tu torchvision.datasets.CIFARxx, vd
+    `np.save(path, dataset.data)`):
+      - images_path : uint8, shape [N, 32, 32, 3] (HWC, RGB). Tu dong
+                      chuyen [N, 3, 32, 32] (CHW) -> HWC neu phat hien.
       - labels_path : int, shape [N].
     """
     def __init__(self, images_path: str, labels_path: str, transform=None):
@@ -438,7 +371,6 @@ class NpyImageDataset(Dataset):
             raise ValueError(
                 f"[NpyImageDataset] Mong doi anh 4 chieu [N,H,W,C] hoac [N,C,H,W], "
                 f"nhung nhan duoc shape={self.images.shape} tu {images_path}")
-        # CHW -> HWC neu can (so sanh truc tiep voi truong hop HWC chuan).
         if self.images.shape[1] == 3 and self.images.shape[-1] != 3:
             self.images = self.images.transpose(0, 2, 3, 1)
         if self.images.dtype != np.uint8:
@@ -462,8 +394,8 @@ class NpyImageDataset(Dataset):
 
 def build_cifar100_loaders(cfg: Config, batch_size: int):
     """Doc CIFAR-100 train/test TU .npy CO SAN trong cfg.cifar100_dir (khong tai lai)."""
-    train_tf = build_cnn_transforms(cfg, train=True)
-    eval_tf  = build_cnn_transforms(cfg, train=False)
+    train_tf = build_image_transforms(cfg, train=True)
+    eval_tf  = build_image_transforms(cfg, train=False)
     train_set = NpyImageDataset(
         os.path.join(cfg.cifar100_dir, "train_images.npy"),
         os.path.join(cfg.cifar100_dir, "train_labels.npy"),
@@ -484,13 +416,9 @@ def build_cifar100_loaders(cfg: Config, batch_size: int):
 
 
 def build_cifar10_ood_loader(cfg: Config, batch_size: int):
-    """
-    CIFAR-10 dung LAM OOD test set cho model train tren CIFAR-100, doc TU
-    .npy CO SAN trong cfg.cifar10_dir (khong tai lai). Khong can nhan that
-    (label CIFAR-10 khong tuong ung voi 100-class head cua model), chi can
-    anh -> dung de do do bat dinh / OOD score.
-    """
-    eval_tf = build_cnn_transforms(cfg, train=False)
+    """CIFAR-10 dung LAM OOD test set cho model train tren CIFAR-100, doc TU
+    .npy CO SAN trong cfg.cifar10_dir (khong tai lai)."""
+    eval_tf = build_image_transforms(cfg, train=False)
     ood_set = NpyImageDataset(
         os.path.join(cfg.cifar10_dir, "test_images.npy"),
         os.path.join(cfg.cifar10_dir, "test_labels.npy"),
@@ -515,12 +443,9 @@ class _FixedIndexSubset(Dataset):
 
 
 def build_umap_probe_batch(cfg: Config, dataset_name: str = "cifar100") -> dict:
-    """
-    Tao 1 mini-batch CO DINH (theo umap_seed) dung de ve UMAP xuyen suot
-    training, doc tu .npy CO SAN (khong tai lai). Tra ve dict
-    {"images": Tensor[B,3,H,W], "labels": Tensor[B]}.
-    """
-    eval_tf = build_cnn_transforms(cfg, train=False)
+    """Mini-batch CO DINH (theo umap_seed) dung de ve UMAP xuyen suot
+    training, doc tu .npy CO SAN (khong tai lai)."""
+    eval_tf = build_image_transforms(cfg, train=False)
     if dataset_name == "cifar100":
         base = NpyImageDataset(
             os.path.join(cfg.cifar100_dir, "train_images.npy"),
@@ -541,12 +466,9 @@ def build_umap_probe_batch(cfg: Config, dataset_name: str = "cifar100") -> dict:
 
 
 def build_landscape_loader(cfg: Config):
-    """
-    Loader nho, co dinh, dung de danh gia loss khi quet loss landscape (va
-    khi uoc luong Hessian-trace sharpness), doc tu .npy CO SAN (khong tai
-    lai du lieu).
-    """
-    eval_tf = build_cnn_transforms(cfg, train=False)
+    """Loader nho, co dinh, dung de danh gia loss khi quet loss landscape
+    (va khi uoc luong Hessian-trace sharpness), doc tu .npy CO SAN."""
+    eval_tf = build_image_transforms(cfg, train=False)
     base = NpyImageDataset(
         os.path.join(cfg.cifar100_dir, "train_images.npy"),
         os.path.join(cfg.cifar100_dir, "train_labels.npy"),
@@ -560,14 +482,12 @@ def build_landscape_loader(cfg: Config):
 
 
 # =========================================================================
-# BAYESIAN LAST LAYER  (giu nguyen logic tu ban GPT2, khong doi)
+# BAYESIAN LAST LAYER
 # =========================================================================
 
 class BayesianLastLayer(nn.Module):
-    """
-    Mean-field Gaussian posterior tren last layer: q(W) = N(mu, diag(sigma^2)).
-    Tuong ung Eq. (3) trong paper.
-    """
+    """Mean-field Gaussian posterior tren last layer: q(W) = N(mu, diag(sigma^2)).
+    Tuong ung Eq. (3) trong paper."""
     def __init__(self, in_features, out_features, prior_std=1.0, init_log_sigma=-2.3):
         super().__init__()
         self.in_features  = in_features
@@ -600,46 +520,34 @@ class BayesianLastLayer(nn.Module):
         return kl.sum()
 
 
-_RESNET_BUILDERS = {
-    "resnet50": tvm.resnet50,
-    "resnet18": tvm.resnet18,
-}
-_RESNET_WEIGHTS = {
-    "resnet50": tvm.ResNet50_Weights.IMAGENET1K_V2,
-    "resnet18": tvm.ResNet18_Weights.IMAGENET1K_V1,
-}
-
-
-class BLLCNNClassifier(nn.Module):
+class BLLViTClassifier(nn.Module):
     """
-    ResNet backbone (deterministic, tu torchvision) + Bayesian Last Layer head.
-    Backbone.fc goc (Linear -> 1000 class ImageNet) duoc thay bang
-    nn.Identity(): backbone.forward() khi do tra ve dac trung sau global
-    average pool, shape [B, embed_dim] (2048 cho resnet50, 512 cho resnet18),
-    dung truc tiep lam input h cho BLL head -- tuong tu cach lay CLS token
-    cua ViT o ban truoc, chi khac noi dac trung den tu dau.
+    ViT backbone (timm, deterministic) + Bayesian Last Layer head.
+    timm.create_model(..., num_classes=0) tra ve model voi `forward()` da
+    cho ra dac trung sau pooling (CLS token / global pool), shape
+    [B, embed_dim] (1024 cho vit_large_patch16_224, 768 cho
+    vit_base_patch16_224, lay tu backbone.num_features), dung truc tiep
+    lam input h cho BLL head.
     """
     def __init__(self, backbone: nn.Module, head: BayesianLastLayer):
         super().__init__()
-        self.backbone = backbone   # torchvision ResNet voi fc = Identity()
+        self.backbone = backbone
         self.head     = head
 
     @classmethod
-    def from_torchvision_name(cls, model_name, num_labels, pretrained,
-                              prior_std, init_log_sigma):
-        if model_name not in _RESNET_BUILDERS:
-            raise ValueError(f"Unsupported CNN backbone: {model_name}")
-        builder = _RESNET_BUILDERS[model_name]
-        weights = _RESNET_WEIGHTS[model_name] if pretrained else None
-        backbone = builder(weights=weights)
-        embed_dim = backbone.fc.in_features    # 2048 (resnet50) / 512 (resnet18)
-        backbone.fc = nn.Identity()            # forward() -> feature [B, embed_dim]
+    def from_timm_name(cls, model_name, num_labels, pretrained, prior_std, init_log_sigma):
+        backbone = timm.create_model(model_name, pretrained=pretrained, num_classes=0)
+        embed_dim = backbone.num_features
         head = BayesianLastLayer(embed_dim, num_labels,
                                  prior_std=prior_std, init_log_sigma=init_log_sigma)
         return cls(backbone, head)
 
+    def enable_gradient_checkpointing(self):
+        if hasattr(self.backbone, "set_grad_checkpointing"):
+            self.backbone.set_grad_checkpointing(enable=True)
+
     def backbone_features(self, images):
-        return self.backbone(images)         # [B, D] (global-avg-pool feature cua ResNet)
+        return self.backbone(images)         # [B, D] (timm ViT, num_classes=0)
 
     def forward(self, images, num_particles):
         h = self.backbone_features(images)
@@ -654,39 +562,18 @@ class BLLCNNClassifier(nn.Module):
 
     def landscape_named_parameters(self):
         """
-        Tham so dung de xay random direction cho loss landscape.
+        Tham so dung de xay random direction cho loss landscape. Chi loai
+        tru "log_sigma" cua BLL head (khong phai thanh phan deterministic
+        cua loss landscape theo nghia thong thuong).
 
-        LOAI TRU (khong nam trong dir1/dir2, giu nguyen gia tri tai theta*
-        trong suot qua trinh quet alpha/beta):
-          - "log_sigma" cua BLL head (giu nguyen tu code cu -- khong phai
-            thanh phan deterministic cua loss landscape theo nghia
-            thong thuong).
-          - TAT CA affine parameter cua BatchNorm2d (weight=gamma, bias=beta).
-            Day la diem khac biet quan trong so voi ban ViT/GPT2 truoc:
-            BN affine la vector 1 chieu (1 gia tri / channel), khong co
-            cau truc "filter" (out_channels, in_channels, kh, kw) de
-            filter-normalize co y nghia hinh hoc (Li et al., 2018);
-            perturb truc tiep BN gamma/beta theo huong ngau nhien filter-
-            normalized se khong tuong ung voi "di chuyen trong khong gian
-            trong so theo huong co y nghia" ma chi la nhieu khong kiem
-            soat duoc cho buoc chuan hoa. Filter-normalize CHI duoc ap
-            dung cho Conv2d.weight / Linear.weight (tensor >= 2 chieu).
-        Luu y: BatchNorm running_mean/running_var la BUFFER (khong phai
-        Parameter), nen von di KHONG xuat hien trong named_parameters();
-        chung duoc xu ly rieng trong _bn_use_batch_stats_context() khi
-        quet landscape (xem ghi chu lon dau file).
+        KHAC voi ban CNN (ResNet + BatchNorm): ViT dung LayerNorm, vector
+        affine weight/bias cua no la 1 chieu va se TU DONG bi zero-out boi
+        dieu kien "d.dim() <= 1" trong filter_normalize_direction() --
+        giong het cach Conv/Linear bias duoc xu ly -- nen KHONG can logic
+        loai-tru rieng (id-based) nhu BatchNorm affine o ban CNN.
         """
-        bn_param_ids = set()
-        for module in self.modules():
-            if isinstance(module, nn.BatchNorm2d):
-                if module.weight is not None:
-                    bn_param_ids.add(id(module.weight))
-                if module.bias is not None:
-                    bn_param_ids.add(id(module.bias))
         for name, p in self.named_parameters():
             if "log_sigma" in name:
-                continue
-            if id(p) in bn_param_ids:
                 continue
             yield name, p
 
@@ -695,7 +582,7 @@ class BLLCNNClassifier(nn.Module):
 # CHECKPOINTING
 # =========================================================================
 
-def save_bll_checkpoint(model: BLLCNNClassifier, cfg: Config, path: str):
+def save_bll_checkpoint(model: BLLViTClassifier, cfg: Config, path: str):
     os.makedirs(path, exist_ok=True)
     torch.save(model.backbone.state_dict(), os.path.join(path, "backbone.pt"))
     torch.save({
@@ -706,26 +593,17 @@ def save_bll_checkpoint(model: BLLCNNClassifier, cfg: Config, path: str):
     }, os.path.join(path, "bll_head.pt"))
     with open(os.path.join(path, "bll_marker.json"), "w") as f:
         json.dump({"is_bll_checkpoint": True}, f)
-    print(f"[checkpoint] saved BLL ResNet model at: {path}")
+    print(f"[checkpoint] saved BLL ViT model at: {path}")
 
 
-def load_bll_checkpoint(path: str, model_name: str, img_size: int = None) -> BLLCNNClassifier:
-    """
-    img_size duoc giu lam tham so de tuong thich chu ky goi cu (ViT can no
-    de dung timm.create_model), nhung KHONG can thiet cho ResNet (kien truc
-    fully-convolutional + adaptive avgpool nen khong phu thuoc img_size khi
-    khoi tao). Tham so duoc bo qua o day.
-    """
-    if model_name not in _RESNET_BUILDERS:
-        raise ValueError(f"Unsupported CNN backbone: {model_name}")
-    backbone = _RESNET_BUILDERS[model_name](weights=None)
-    backbone.fc = nn.Identity()
+def load_bll_checkpoint(path: str, model_name: str) -> BLLViTClassifier:
+    backbone = timm.create_model(model_name, pretrained=False, num_classes=0)
     backbone.load_state_dict(torch.load(os.path.join(path, "backbone.pt"), map_location="cpu"))
     payload = torch.load(os.path.join(path, "bll_head.pt"), map_location="cpu")
     head = BayesianLastLayer(payload["in_features"], payload["out_features"],
                              prior_std=payload["prior_std"])
     head.load_state_dict(payload["head_state_dict"])
-    return BLLCNNClassifier(backbone, head)
+    return BLLViTClassifier(backbone, head)
 
 
 def bll_checkpoint_exists(path: str) -> bool:
@@ -736,19 +614,17 @@ def bll_checkpoint_exists(path: str) -> bool:
 
 
 # =========================================================================
-# UMAP HELPERS  (logic giu nguyen, chi doi nguon du lieu tu text -> image)
+# UMAP HELPERS
 # =========================================================================
 
 @torch.no_grad()
-def collect_particle_logits(model: BLLCNNClassifier, probe_batch: dict, cfg: Config
+def collect_particle_logits(model: BLLViTClassifier, probe_batch: dict, cfg: Config
                             ) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Chay model tren probe_batch voi num_particles, thu logits [B, K, C].
-    Tra ve pts [B*K, C] va labels [B*K] (label sample goc lap lai K lan).
-    """
+    """Chay model tren probe_batch voi num_particles, thu logits [B, K, C].
+    Tra ve pts [B*K, C] va labels [B*K] (label sample goc lap lai K lan)."""
     model.eval()
     images = probe_batch["images"].to(cfg.device)
-    labels = probe_batch["labels"]                    # [B] CPU
+    labels = probe_batch["labels"]
 
     with torch.autocast(
         device_type="cuda" if cfg.device == "cuda" else "cpu",
@@ -788,11 +664,8 @@ def compute_particle_umap_data(
     pts: np.ndarray, labels: np.ndarray, tag: str, global_step: int,
     epoch: int, phase: str, sigma_mean: float, cfg: Config, num_particles: int,
 ) -> dict:
-    """
-    Chay UMAP va dong goi TOAN BO du lieu can de ve lai figure sau nay
-    (embedding 2D, labels, metadata) — TACH RIENG khoi phan ve matplotlib,
-    de co the luu .npz/.json va goi plot_particle_umap() lai voi style khac.
-    """
+    """Chay UMAP va dong goi TOAN BO du lieu can de ve lai figure sau nay,
+    tach rieng khoi phan ve matplotlib."""
     emb = _run_umap(pts, cfg)                # [B*K, 2]
     B = pts.shape[0] // num_particles
     return {
@@ -806,11 +679,8 @@ def compute_particle_umap_data(
 
 
 def plot_particle_umap(data: dict, cfg: Config, style: PlotStyle = DEFAULT_STYLE):
-    """
-    Ve scatter 2 panel tu du lieu da tinh san trong compute_particle_umap_data().
-    Khong forward model / khong chay UMAP lai -- chi doc embedding co san,
-    nen co the goi lai bao nhieu lan tuy y de doi style.
-    """
+    """Ve scatter 2 panel tu du lieu da tinh san. Khong forward model /
+    khong chay UMAP lai -- co the goi lai bao nhieu lan tuy y de doi style."""
     emb            = data["embedding"]
     labels         = data["labels"]
     tag            = data["tag"]
@@ -820,7 +690,6 @@ def plot_particle_umap(data: dict, cfg: Config, style: PlotStyle = DEFAULT_STYLE
 
     fig, axes = plt.subplots(1, 2, figsize=(style.figsize_wide[0] + 2, style.figsize_wide[1] + 1.5))
 
-    # ── Panel trai: tat ca particles ──────────────────────────────────────
     ax = axes[0]
     for k in range(num_particles):
         idx    = np.arange(B) * num_particles + k
@@ -843,7 +712,6 @@ def plot_particle_umap(data: dict, cfg: Config, style: PlotStyle = DEFAULT_STYLE
     ax.tick_params(labelsize=style.tick_fontsize)
     ax.grid(alpha=style.grid_alpha * 0.6)
 
-    # ── Panel phai: posterior spread per sample ─────────────────────────
     ax2 = axes[1]
     for b in range(B):
         idx   = b * num_particles + np.arange(num_particles)
@@ -907,25 +775,21 @@ def run_and_plot_dual_umap(teacher_model, student_model, teacher_probe, student_
 def pairwise_dist_matrix(resp: torch.Tensor, distance: str) -> torch.Tensor:
     """
     resp: [B, K, C] -- K responses (particle) cho moi sample trong batch.
-    Tra ve C: [B, K, K] voi C[b,i,j] = d(resp[b,i], resp[b,j]).
-    Day chinh la "single-input" cost matrix trong Algorithm 1: moi sample b
-    trong batch co MOT cost matrix K x K rieng, KHONG gop cac sample lai
-    (khac voi Algorithm 2 batch-pooled, noi cost matrix la (nK) x (nK)).
+    Tra ve C: [B, K, K] voi C[b,i,j] = d(resp[b,i], resp[b,j]). Day chinh
+    la "single-input" cost matrix trong Algorithm 1: moi sample b trong
+    batch co MOT cost matrix K x K rieng (khac voi Algorithm 2
+    batch-pooled, noi cost matrix la (nK) x (nK)).
     """
     if distance == "cosine":
         resp_n = F.normalize(resp.float(), dim=-1)
         sim = torch.bmm(resp_n, resp_n.transpose(1, 2))     # [B,K,K]
         return 1.0 - sim
-    # mac dinh: squared Euclidean, dung torch.cdist theo batch
     return torch.cdist(resp.float(), resp.float(), p=2.0) ** 2
 
 
 def compute_entropic_gw(CT, CS, epsilon, sinkhorn_iters, outer_iters):
-    """
-    Entropic GW (Eq. 4 trong paper), giai bang Sinkhorn-based proximal-point
-    scheme (Peyre et al. 2016), vector hoa qua batch dim B. CT, CS deu co
-    shape [B, K, K] (B cost matrix K x K doc lap, single-input).
-    """
+    """Entropic GW (Eq. 4 trong paper), giai bang Sinkhorn-based proximal-point
+    scheme (Peyre et al. 2016), vector hoa qua batch dim B."""
     B, K, _ = CT.shape
     device, dtype = CT.device, torch.float32
     CT = CT.to(dtype)
@@ -959,10 +823,7 @@ def compute_entropic_gw(CT, CS, epsilon, sinkhorn_iters, outer_iters):
 
 
 def gw_structural_loss(teacher_resp, student_resp, cfg: Config):
-    """
-    teacher_resp, student_resp: [B, K, C] (K particle responses cho tung
-    sample trong batch, single-input). Tra ve scalar = trung binh GW qua B.
-    """
+    """teacher_resp, student_resp: [B, K, C]. Tra ve scalar = trung binh GW qua B."""
     CT = pairwise_dist_matrix(teacher_resp, cfg.gw_distance).detach()
     CS = pairwise_dist_matrix(student_resp, cfg.gw_distance)
     return compute_entropic_gw(
@@ -971,7 +832,7 @@ def gw_structural_loss(teacher_resp, student_resp, cfg: Config):
 
 
 # =========================================================================
-# SCHEDULE  (giu nguyen logic 3-phase tu ban GPT2)
+# SCHEDULE  (3-phase: task-only -> posterior -> structural)
 # =========================================================================
 
 def student_schedule_weights(epoch, cfg: Config):
@@ -990,28 +851,14 @@ def student_schedule_weights(epoch, cfg: Config):
 
 
 # =========================================================================
-# EVALUATION  (in-distribution: accuracy/F1 nhu cu; them OOD entropy score)
-# =========================================================================
-
-# =========================================================================
-# ECE (Expected Calibration Error)  -- Sec 6.2: "accuracy, ECE, and
-# Hessian-trace sharpness" cua benchmark CV-2.
+# EVALUATION (accuracy/F1/ECE in-distribution; predictive entropy for OOD)
 # =========================================================================
 
 def compute_ece(probs: np.ndarray, labels: np.ndarray, n_bins: int = 15) -> float:
     """
-    Expected Calibration Error (Naeini et al. 2015 / Guo et al. 2017,
-    "On Calibration of Modern Neural Networks").
-
-    probs  : [N, C] xac suat du doan (vd posterior-predictive softmax, da
-             trung binh qua K particle, hoac mean-forward softmax).
-    labels : [N] nhan that.
-
-    Chia [0, 1] thanh n_bins bin deu theo confidence = max_c probs[n, c].
-    Voi moi bin: do lech |accuracy(bin) - confidence(bin)|, trong so theo
-    ty le so sample roi vao bin do (|bin| / N). ECE = tong trong so cac
-    do lech nay -- cang gan 0 nghia la model cang "hieu chuan tot"
-    (confidence phan anh dung xac suat dung thuc te).
+    Expected Calibration Error (Naeini et al. 2015 / Guo et al. 2017).
+    Chia [0,1] thanh n_bins bin deu theo confidence = max_c probs[n,c]; voi
+    moi bin do |accuracy(bin) - confidence(bin)|, trong so theo |bin|/N.
     """
     confidences = probs.max(axis=1)
     predictions = probs.argmax(axis=1)
@@ -1032,26 +879,18 @@ def compute_ece(probs: np.ndarray, labels: np.ndarray, n_bins: int = 15) -> floa
 
 
 @torch.no_grad()
-def evaluate_classification_metrics(model: BLLCNNClassifier, loader, device, dtype, num_particles,
+def evaluate_classification_metrics(model: BLLViTClassifier, loader, device, dtype, num_particles,
                                     ece_num_bins: int = 15):
-    """
-    Giu nguyen logic tu ban GPT2: K particles duoc SAMPLE 1 LAN DUY NHAT o
-    batch dau (W co dinh cho ca eval set), tra ve ca posterior-predictive
-    (accuracy/f1) lan mean-forward (accuracy_mean/f1_mean) va per-particle
-    max/min (accuracy_max/min, f1_max/min).
-
-    THEM MOI: ece / ece_mean -- Expected Calibration Error (xem
-    compute_ece()), tinh tren cung 2 bo xac suat dung de tinh
-    accuracy/accuracy_mean (posterior-predictive va mean-forward), cung
-    bin-config voi cfg.ece_num_bins (truyen vao qua ece_num_bins).
-    """
+    """K particles duoc SAMPLE 1 LAN DUY NHAT o batch dau (W co dinh cho ca
+    eval set); tra ve posterior-predictive (accuracy/f1), mean-forward
+    (accuracy_mean/f1_mean), per-particle max/min, va ECE/ece_mean."""
     model.eval()
     all_labels       = []
     postpred_preds   = []
     mean_preds       = []
     particle_preds   = [[] for _ in range(num_particles)]
-    postpred_probs   = []   # [N, C] -- de tinh ECE (posterior-predictive)
-    mean_probs       = []   # [N, C] -- de tinh ECE (mean-forward)
+    postpred_probs   = []
+    mean_probs       = []
     total_loss, n_batches = 0.0, 0
     W = None
 
@@ -1074,8 +913,8 @@ def evaluate_classification_metrics(model: BLLCNNClassifier, loader, device, dty
             particle_logits.reshape(B * K, C),
             labels.unsqueeze(1).expand(-1, K).reshape(-1),
         )
-        probs      = F.softmax(particle_logits, dim=-1).mean(dim=1)   # posterior-predictive [B,C]
-        mean_probs_b = F.softmax(mean_logits, dim=-1)                  # mean-forward [B,C]
+        probs      = F.softmax(particle_logits, dim=-1).mean(dim=1)
+        mean_probs_b = F.softmax(mean_logits, dim=-1)
         postpred_preds.extend(torch.argmax(probs, dim=-1).cpu().tolist())
         mean_preds.extend(torch.argmax(mean_logits, dim=-1).cpu().tolist())
         postpred_probs.append(probs.cpu().numpy())
@@ -1112,14 +951,11 @@ def evaluate_classification_metrics(model: BLLCNNClassifier, loader, device, dty
 
 
 @torch.no_grad()
-def compute_predictive_entropy_scores(model: BLLCNNClassifier, loader, cfg: Config,
+def compute_predictive_entropy_scores(model: BLLViTClassifier, loader, cfg: Config,
                                       num_particles: int, max_batches: Optional[int] = None
                                       ) -> np.ndarray:
-    """
-    Tinh entropy cua posterior-predictive softmax (trung binh qua K particle)
-    cho tung sample trong loader -- dung lam OOD score (Sec 6.2/6.5: AUROC
-    cho OOD detection). Entropy cao hon = model bat dinh hon ve sample do.
-    """
+    """Entropy cua posterior-predictive softmax (trung binh qua K particle)
+    cho tung sample -- dung lam OOD score. Entropy cao hon = bat dinh hon."""
     model.eval()
     entropies = []
     for i, (images, _labels) in enumerate(loader):
@@ -1135,12 +971,10 @@ def compute_predictive_entropy_scores(model: BLLCNNClassifier, loader, cfg: Conf
     return np.array(entropies, dtype=np.float64)
 
 
-def evaluate_ood_auroc(model: BLLCNNClassifier, id_loader, ood_loader, cfg: Config,
+def evaluate_ood_auroc(model: BLLViTClassifier, id_loader, ood_loader, cfg: Config,
                        max_batches_each: int = 50) -> dict:
-    """
-    AUROC cho bai toan phan biet ID (CIFAR-100 test) vs OOD (CIFAR-10 test)
-    dua tren predictive entropy. label 1 = OOD, score = entropy.
-    """
+    """AUROC cho ID (CIFAR-100 test) vs OOD (CIFAR-10 test) dua tren
+    predictive entropy. label 1 = OOD, score = entropy."""
     id_scores  = compute_predictive_entropy_scores(
         model, id_loader, cfg, cfg.ood_num_particles, max_batches=max_batches_each)
     ood_scores = compute_predictive_entropy_scores(
@@ -1155,31 +989,20 @@ def evaluate_ood_auroc(model: BLLCNNClassifier, id_loader, ood_loader, cfg: Conf
 
 
 # =========================================================================
-# HESSIAN-TRACE SHARPNESS  (Sec 6.2: "accuracy, ECE, and Hessian-trace
-# sharpness, used specifically to test the necessary-condition gap of
-# Proposition 5.3."). Uoc luong Tr(H) bang Hutchinson estimator + double
-# backprop (Pearlmutter 1994 Hessian-vector product), cung tinh than voi
-# PyHessian (Yao et al., 2020, "PyHessian: Neural Networks Through the
-# Lens of the Hessian"). Hessian o day la cua mean-forward CE loss
-# (giong loss dung trong evaluate_classification_loss() cho loss
-# landscape) theo TOAN BO tham so co the train cua model, tai theta*
-# HIEN TAI (KHONG perturb -- khac voi loss landscape).
+# HESSIAN-TRACE SHARPNESS (Hutchinson estimator + double backprop, cung
+# tinh than voi PyHessian / Yao et al. 2020). Hessian cua mean-forward CE
+# loss tai theta* HIEN TAI (KHONG perturb).
 # =========================================================================
 
-def compute_hessian_trace(model: BLLCNNClassifier, params: List[torch.Tensor],
+def compute_hessian_trace(model: BLLViTClassifier, params: List[torch.Tensor],
                           images: torch.Tensor, labels: torch.Tensor,
                           num_hutchinson_samples: int, seed: Optional[int] = None) -> float:
     """
-    Tr(H) ~= (1/M) * sum_{i=1}^{M} z_i^T H z_i, voi z_i ~ Rademacher({-1,+1})
-    i.i.d. (Hutchinson, 1990), H = Hessian cua CE loss (mean-forward, tren
-    1 batch co dinh `images`/`labels`) theo `params`.
-
-    Toi uu: grad bac 1 (first_grads, create_graph=True) chi can tinh 1 LAN
-    cho ca M mau Hutchinson (vi no khong phu thuoc z_i); voi MOI z_i chi
-    can 1 lan backward bac 2 them: Hz_i = d(first_grads . z_i)/d(params).
-    Generator rieng (khong dung torch.manual_seed toan cuc) de KHONG lam
-    xao tron RNG stream chinh cua training loop (sampling particle weight,
-    dropout, data shuffling, ...) khi ham nay duoc goi xen giua cac epoch.
+    Tr(H) ~= (1/M) * sum_i z_i^T H z_i, voi z_i ~ Rademacher i.i.d.
+    (Hutchinson, 1990). Grad bac 1 (create_graph=True) chi tinh 1 LAN cho
+    ca M mau; moi z_i chi can 1 lan backward bac 2 them. Generator rieng
+    (khong dung torch.manual_seed toan cuc) de khong lam xao tron RNG
+    stream chinh cua training loop.
     """
     logits = model.forward_mean(images)
     loss = F.cross_entropy(logits.float(), labels)
@@ -1196,36 +1019,26 @@ def compute_hessian_trace(model: BLLCNNClassifier, params: List[torch.Tensor],
             for p in params
         ]
         dot = sum((g * v).sum() for g, v in zip(first_grads, vecs))
-        retain = i < num_hutchinson_samples - 1   # giai phong graph o lan cuoi de tiet kiem VRAM
+        retain = i < num_hutchinson_samples - 1
         hv = torch.autograd.grad(dot, params, retain_graph=retain)
         trace_est = sum((h * v).sum().item() for h, v in zip(hv, vecs))
         trace_samples.append(trace_est)
     return float(np.mean(trace_samples))
 
 
-def evaluate_hessian_trace_sharpness(model: BLLCNNClassifier, loader, cfg: Config,
+def evaluate_hessian_trace_sharpness(model: BLLViTClassifier, loader, cfg: Config,
                                      seed: Optional[int] = None) -> float:
     """
     Uoc luong Hessian-trace sharpness cua model HIEN TAI, trung binh qua
-    cfg.hessian_eval_batches batch co dinh lay tu `loader` (thuong la
-    build_landscape_loader(cfg), cung bo du lieu nho/co dinh dung cho loss
-    landscape, vi cung phuc vu do "do phang" quanh theta*) va
-    cfg.hessian_num_hutchinson_samples vector Rademacher cho moi batch.
+    cfg.hessian_eval_batches batch co dinh (thuong la build_landscape_loader(cfg))
+    va cfg.hessian_num_hutchinson_samples vector Rademacher moi batch.
 
-    QUAN TRONG:
-      - Ham nay can GRADIENT BAC 2 (double backprop) nen KHONG duoc goi
-        duoi torch.no_grad(); cung KHONG duoc trang trí @torch.no_grad().
-      - Chay o FULL PRECISION (KHONG boc trong torch.autocast) vi double
-        backward voi bfloat16 de mat on dinh so/tran gia tri hon nhieu so
-        voi forward/backward bac 1 thong thuong.
-      - Dung torch.autograd.grad() (KHONG goi loss.backward()) nen KHONG
-        ghi vao .grad cua tham so -> AN TOAN de goi xen giua training loop,
-        khong anh huong optimizer.step()/zero_grad() cua vong lap chinh.
-      - BatchNorm running_mean/running_var VAN HOP LE o day (khac voi loss
-        landscape): model dang o DUNG theta* hien tai, KHONG bi nhieu nhu
-        khi quet (alpha, beta), nen khong can _bn_use_batch_stats_context().
-      - Chi phi cao hon accuracy/F1/ECE nhieu lan (M backward bac 2 / batch),
-        nen so batch va so Hutchinson-sample duoc gioi han qua config.
+    Can GRADIENT BAC 2 (double backprop) nen KHONG duoc goi duoi
+    torch.no_grad(). Chay o FULL PRECISION (khong autocast) vi double
+    backward voi bfloat16 de mat on dinh so hon backward bac 1. Dung
+    torch.autograd.grad() (khong loss.backward()) nen an toan de goi xen
+    giua training loop. LayerNorm khong co running stats nen khong can xu
+    ly gi them o day (khac voi BatchNorm o ban CNN).
     """
     was_training = model.training
     model.eval()
@@ -1251,32 +1064,27 @@ def evaluate_hessian_trace_sharpness(model: BLLCNNClassifier, loader, cfg: Confi
 
 
 # =========================================================================
-# STAGE 1: TEACHER FIT  (pretrained ResNet-50 backbone + BLL head)
+# STAGE 1: TEACHER FIT  (pretrained ViT-Large backbone + BLL head)
 # =========================================================================
 
 def fit_teacher(cfg: Config) -> Tuple[str, List[Dict]]:
     """
-    Teacher = ResNet-50 PRETRAINED (torchvision, ImageNet weights) + BLL head
-    moi khoi tao. Backbone pretrained co the duoc finetune nhe (lr nho hon,
-    cfg.teacher_backbone_lr_mult) hoac freeze hoan toan (teacher_finetune_backbone
-    = False), trong khi BLL head luon duoc hoc tu dau qua ELBO.
-
-    YEU CAU: so epoch fit teacher = so epoch distill student
-    (CFG.teacher_num_epochs da duoc gan = CFG.student_num_epochs ngay sau
-    khi tao CFG, xem phia tren).
+    Teacher = ViT-Large PRETRAINED (timm, ImageNet weights) + BLL head moi
+    khoi tao. Backbone pretrained co the duoc finetune nhe (lr nho hon,
+    cfg.teacher_backbone_lr_mult) hoac freeze hoan toan
+    (teacher_finetune_backbone=False), trong khi BLL head luon hoc tu dau
+    qua ELBO. So epoch fit teacher = so epoch distill student (CFG.teacher_num_epochs
+    da duoc gan = CFG.student_num_epochs ngay sau khi tao CFG).
     """
     print(f"\n{'='*80}\nSTAGE 1: FITTING TEACHER BLL (pretrained backbone) -- {cfg.teacher_name}\n{'='*80}")
 
-    model = BLLCNNClassifier.from_torchvision_name(
+    model = BLLViTClassifier.from_timm_name(
         cfg.teacher_name, cfg.num_labels, cfg.teacher_pretrained,
         cfg.prior_std, cfg.init_log_sigma,
     )
     model.to(cfg.device)
-    # Luu y: torchvision ResNet khong co API set_grad_checkpointing() nhu
-    # timm ViT; gradient checkpointing cho ResNet (neu can tiet kiem VRAM)
-    # phai duoc cai qua torch.utils.checkpoint thu cong tren tung block,
-    # nen bi bo qua o day (use_gradient_checkpointing khong co tac dung
-    # voi backbone ResNet, chi con giu lai trong Config de tuong thich).
+    if cfg.use_gradient_checkpointing:
+        model.enable_gradient_checkpointing()
 
     if not cfg.teacher_finetune_backbone:
         for p in model.backbone.parameters():
@@ -1284,14 +1092,10 @@ def fit_teacher(cfg: Config) -> Tuple[str, List[Dict]]:
 
     print(f"[UMAP] Building teacher probe batch ({cfg.umap_probe_samples} samples)...")
     umap_probe = build_umap_probe_batch(cfg, dataset_name="cifar100")
-    print(f"[Hessian] Building fixed eval batches for Hessian-trace sharpness "
-          f"({cfg.hessian_eval_batches} batches x {cfg.landscape_eval_batch_size})...")
-    hessian_loader = build_landscape_loader(cfg)
 
     train_loader, eval_loader = build_cifar100_loaders(cfg, cfg.batch_size)
     n_train = len(train_loader.dataset)
 
-    # Backbone pretrained: lr nho hon (neu finetune); head BLL: lr binh thuong.
     if cfg.teacher_finetune_backbone:
         param_groups = [
             {"params": model.backbone.parameters(), "lr": cfg.learning_rate * cfg.teacher_backbone_lr_mult},
@@ -1316,7 +1120,7 @@ def fit_teacher(cfg: Config) -> Tuple[str, List[Dict]]:
     history: List[Dict] = []
     model.train()
     global_step      = 0
-    latest_ckpt_path = os.path.join(cfg.checkpoint_dir, "teacher_resnet50_bll_latest")
+    latest_ckpt_path = os.path.join(cfg.checkpoint_dir, "teacher_vit_large_bll_latest")
 
     epoch_pbar = tqdm(range(1, cfg.teacher_num_epochs + 1), desc="teacher epochs", unit="epoch")
     for epoch in epoch_pbar:
@@ -1406,7 +1210,7 @@ def fit_teacher(cfg: Config) -> Tuple[str, List[Dict]]:
               f"  sigma_mean={s['sigma_mean']:.4f}")
         model.train()
 
-    ckpt_path = os.path.join(cfg.checkpoint_dir, "teacher_resnet50_bll")
+    ckpt_path = os.path.join(cfg.checkpoint_dir, "teacher_vit_large_bll")
     save_bll_checkpoint(model, cfg, ckpt_path)
 
     del model, optimizer, scheduler
@@ -1416,25 +1220,22 @@ def fit_teacher(cfg: Config) -> Tuple[str, List[Dict]]:
 
 
 # =========================================================================
-# STAGE 2: STUDENT DISTILLATION  (ResNet-18, random init, single-input GW)
+# STAGE 2: STUDENT DISTILLATION  (ViT-Base, random init, single-input GW)
 # =========================================================================
 
-def distill_student(cfg: Config, teacher_ckpt_path: str, teacher_model_for_umap: BLLCNNClassifier
+def distill_student(cfg: Config, teacher_ckpt_path: str, teacher_model_for_umap: BLLViTClassifier
                     ) -> Tuple[str, List[Dict]]:
-    """
-    Student = ResNet-18 KHONG pretrained (distill tu dau). Logic giong het
-    ban GPT2/ViT (3-phase schedule, ELBO + GW single-input), chi doi domain
-    anh/CNN va nguon du lieu CIFAR-100.
-    """
+    """Student = ViT-Base KHONG pretrained (distill tu dau). 3-phase
+    schedule + ELBO + GW single-input, giong logic ban CNN."""
     print(f"\n{'='*80}\nSTAGE 2: DISTILLING STUDENT -- {cfg.student_name}\n{'='*80}")
 
-    student = BLLCNNClassifier.from_torchvision_name(
+    student = BLLViTClassifier.from_timm_name(
         cfg.student_name, cfg.num_labels, cfg.student_pretrained,
         cfg.prior_std, cfg.init_log_sigma,
     )
     student.to(cfg.device)
-    # (Khong co gradient checkpointing cho ResNet o day -- xem ghi chu
-    # tuong tu trong fit_teacher().)
+    if cfg.use_gradient_checkpointing:
+        student.enable_gradient_checkpointing()
 
     # Teacher dung de tinh logits distill (frozen, tu checkpoint).
     teacher = load_bll_checkpoint(teacher_ckpt_path, cfg.teacher_name)
@@ -1443,8 +1244,7 @@ def distill_student(cfg: Config, teacher_ckpt_path: str, teacher_model_for_umap:
     for p in teacher.parameters():
         p.requires_grad_(False)
 
-    # Teacher dung de ve UMAP (giu the rieng nhu ban GPT2, du thuc te trung
-    # voi `teacher` o tren nhung tach bien de giu dung kien truc goc).
+    # Teacher dung de ve UMAP (tach bien de giu dung kien truc goc).
     teacher_model_for_umap.to(cfg.device)
     teacher_model_for_umap.eval()
     for p in teacher_model_for_umap.parameters():
@@ -1474,7 +1274,7 @@ def distill_student(cfg: Config, teacher_ckpt_path: str, teacher_model_for_umap:
     history: List[Dict] = []
     student.train()
     global_step      = 0
-    latest_ckpt_path = os.path.join(cfg.checkpoint_dir, "student_resnet18_bll_gw_latest")
+    latest_ckpt_path = os.path.join(cfg.checkpoint_dir, "student_vit_base_bll_gw_latest")
 
     epoch_pbar = tqdm(range(1, cfg.student_num_epochs + 1), desc="student (BLL+GW) epochs", unit="epoch")
     for epoch in epoch_pbar:
@@ -1592,7 +1392,7 @@ def distill_student(cfg: Config, teacher_ckpt_path: str, teacher_model_for_umap:
               f"  sigma_mean={s['sigma_mean']:.4f}")
         student.train()
 
-    ckpt_path = os.path.join(cfg.checkpoint_dir, "student_resnet18_bll_gw")
+    ckpt_path = os.path.join(cfg.checkpoint_dir, "student_vit_base_bll_gw")
     save_bll_checkpoint(student, cfg, ckpt_path)
 
     del student, teacher, teacher_model_for_umap, optimizer, scheduler
@@ -1602,9 +1402,12 @@ def distill_student(cfg: Config, teacher_ckpt_path: str, teacher_model_for_umap:
 
 
 # =========================================================================
-# LOSS LANDSCAPE  (CNN/ResNet -- can xu ly rieng BatchNorm, xem ghi chu
-# lon o dau file. eval_loss dung CIFAR-100, range alpha/beta = [-2, 2]).
+# LOSS LANDSCAPE
 # =========================================================================
+# ViT dung LayerNorm (khong co running stats), nen KHONG can context-manager
+# dac biet nhu _bn_use_batch_stats_context o ban CNN. LayerNorm affine
+# (1 chieu) bi zero-out tu dong boi dieu kien "dim() <= 1" trong
+# filter_normalize_direction(), giong het bias.
 
 def get_random_direction_like(params):
     return [torch.randn_like(p) for p in params]
@@ -1614,18 +1417,11 @@ def filter_normalize_direction(direction, params):
     """
     Filter normalization (Li et al., 2018): voi moi tensor trong so p va
     huong ngau nhien d cung shape, scale d theo ti le ||p|| / ||d|| de
-    "nhieu" co bien do tuong xung voi do lon cua chinh trong so do (thay
-    vi 1 buoc nhieu co do lon co dinh cho moi layer, von se khong cong
-    bang giua cac layer co norm rat khac nhau).
+    "nhieu" co bien do tuong xung voi do lon cua chinh trong so do.
 
-    Voi tensor 1 chieu (vd: Conv/Linear bias con sot lai sau khi da loai
-    BN affine trong landscape_named_parameters()), khong co cau truc
-    "filter" de chuan hoa theo nghia hinh hoc -> zero-out (giu nguyen tai
-    theta*, khong di chuyen theo huong nay), giong cach Li et al. xu ly.
-    Luu y: BN affine (weight/bias) DA duoc loai khoi `params` tu truoc
-    (trong landscape_named_parameters()), nen dieu kien "dim() <= 1" o day
-    chi con anh huong toi Conv/Linear bias thong thuong, khong con la noi
-    DUY NHAT chiu trach nhiem loai BN affine nhu ban truoc.
+    Tensor 1 chieu (LayerNorm weight/bias, Linear bias, ...) khong co cau
+    truc "filter" de chuan hoa theo nghia hinh hoc -> zero-out (giu nguyen
+    tai theta*, khong di chuyen theo huong nay).
     """
     for d, p in zip(direction, params):
         if d.dim() <= 1:
@@ -1644,89 +1440,10 @@ def apply_perturbation(params, base_params, dir1, dir2, alpha, beta):
         p.copy_(p0 + alpha * d1 + beta * d2)
 
 
-class _bn_use_batch_stats_context:
-    """
-    Context manager xu ly van de BatchNorm khi quet loss landscape cho CNN.
-
-    Van de: BatchNorm2d.running_mean / running_var la BUFFER, KHONG PHAI
-    Parameter, nen KHONG nam trong named_parameters() va do do KHONG duoc
-    di chuyen theo (alpha, beta) trong apply_perturbation(). Sau khi cong
-    nhieu vao Conv/Linear weight, cac running stats cu (uoc luong tai
-    theta*) khong con phan anh dung phan bo activation tai diem moi trong
-    khong gian trong so -> loss tinh duoc se bi nhieu/sai mot cach he
-    thong, KHONG phai do ban than "do phang" cua diem do.
-
-    Cach xu ly (giong cach lam cua Li et al., 2018, "Visualizing the Loss
-    Landscape of Neural Nets"): tai moi diem luoi, TAM THOI cho moi
-    BatchNorm2d hoat dong o che do "dung batch statistics tuc thoi" --
-    tuc la set `track_running_stats=False` VA `training=True` cho rieng
-    cac module BatchNorm2d (trong khi phan con lai cua model van o eval()
-    cho cac layer khac nhu Dropout) -- PyTorch khi do se tu tinh mean/var
-    TREN CHINH BATCH dang forward thay vi doc running_mean/running_var co
-    dinh. Dieu nay giup loss tai moi diem (alpha, beta) phan anh dung hanh
-    vi cua mang VOI trong so tai diem do, thay vi bi "khoa" vao thong ke
-    cu cua theta*.
-
-    Sau khi quet xong (__exit__), TAT CA BatchNorm2d duoc khoi phuc nguyen
-    trang: track_running_stats=True va running_mean/running_var/num_batches_tracked
-    duoc set lai dung gia tri da luu truoc do (deep copy tai __enter__),
-    de khong lam hong checkpoint/trang thai cua model sau khi ve landscape.
-    """
-    def __init__(self, model: nn.Module, enabled: bool = True):
-        self.model = model
-        self.enabled = enabled
-        self._bn_modules: List[nn.BatchNorm2d] = []
-        self._saved_running_mean: List[Optional[torch.Tensor]] = []
-        self._saved_running_var: List[Optional[torch.Tensor]] = []
-        self._saved_num_batches: List[Optional[torch.Tensor]] = []
-        self._saved_track_flag: List[bool] = []
-
-    def __enter__(self):
-        if not self.enabled:
-            return self
-        for m in self.model.modules():
-            if isinstance(m, nn.BatchNorm2d):
-                self._bn_modules.append(m)
-                self._saved_running_mean.append(
-                    m.running_mean.detach().clone() if m.running_mean is not None else None)
-                self._saved_running_var.append(
-                    m.running_var.detach().clone() if m.running_var is not None else None)
-                self._saved_num_batches.append(
-                    m.num_batches_tracked.detach().clone() if m.num_batches_tracked is not None else None)
-                self._saved_track_flag.append(m.track_running_stats)
-                # track_running_stats=False -> forward() dung batch stats
-                # tuc thoi (khong doc/ghi running_mean/var), bat ke
-                # module.training la True hay False.
-                m.track_running_stats = False
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        if not self.enabled:
-            return False
-        for m, rm, rv, nbt, flag in zip(
-            self._bn_modules, self._saved_running_mean, self._saved_running_var,
-            self._saved_num_batches, self._saved_track_flag,
-        ):
-            m.track_running_stats = flag
-            if rm is not None:
-                m.running_mean.copy_(rm)
-            if rv is not None:
-                m.running_var.copy_(rv)
-            if nbt is not None:
-                m.num_batches_tracked.copy_(nbt)
-        return False
-
-
 @torch.no_grad()
-def evaluate_classification_loss(model: BLLCNNClassifier, loader, device, dtype, max_batches=None):
-    """
-    model.eval() duoc giu nguyen (Dropout tat, v.v.), nhung BatchNorm2d se
-    dung batch statistics tuc thoi NEU duoc bao boc boi
-    `_bn_use_batch_stats_context` o ngoai ham nay (xem compute_loss_landscape).
-    Khi track_running_stats=False, PyTorch tinh batch-norm tu chinh batch
-    dau vao bat ke gia tri cua module.training, nen viec goi model.eval()
-    o day van an toan va khong xung dot voi co che do.
-    """
+def evaluate_classification_loss(model: BLLViTClassifier, loader, device, dtype, max_batches=None):
+    """Mean-forward CE loss tren mot so batch co dinh, dung de quet loss
+    landscape. Khong can xu ly gi dac biet cho LayerNorm (khac BatchNorm)."""
     model.eval()
     total_loss, n_batches = 0.0, 0
     for i, (images, labels) in enumerate(loader):
@@ -1744,18 +1461,13 @@ def evaluate_classification_loss(model: BLLCNNClassifier, loader, device, dtype,
     return total_loss / max(1, n_batches)
 
 
-def compute_loss_landscape(model: BLLCNNClassifier, loader, cfg: Config, seed=0):
-    """
-    Quet loss landscape tren luoi (alpha, beta) trong
-    [cfg.landscape_alpha_range] x [cfg.landscape_beta_range] (mac dinh
-    [-2, 2] theo yeu cau). Toan bo vong quet duoc boc trong
-    `_bn_use_batch_stats_context(model, enabled=cfg.landscape_bn_use_batch_stats)`
-    de tranh van de running-stats-mismatch cua BatchNorm da neu o dau file.
-    """
+def compute_loss_landscape(model: BLLViTClassifier, loader, cfg: Config, seed=0):
+    """Quet loss landscape tren luoi (alpha, beta) trong
+    [cfg.landscape_alpha_range] x [cfg.landscape_beta_range] (mac dinh [-2,2])."""
     device = cfg.device
     grid   = cfg.landscape_grid_size
     torch.manual_seed(seed)
-    named       = list(model.landscape_named_parameters())  # da loai BN affine + log_sigma
+    named       = list(model.landscape_named_parameters())  # da loai log_sigma
     params      = [p for _, p in named]
     base_params = [p.detach().clone() for p in params]
     dir1 = get_random_direction_like(params)
@@ -1767,15 +1479,15 @@ def compute_loss_landscape(model: BLLCNNClassifier, loader, cfg: Config, seed=0)
     loss_grid = np.zeros((grid, grid), dtype=np.float64)
     model.to(device)
     coords = [(i, a, j, b) for i, a in enumerate(alphas) for j, b in enumerate(betas)]
-    pbar = tqdm(coords, total=grid*grid, desc="Loss landscape grid (BN batch-stats)", unit="pt")
+    pbar = tqdm(coords, total=grid*grid, desc="Loss landscape grid", unit="pt")
 
-    with _bn_use_batch_stats_context(model, enabled=cfg.landscape_bn_use_batch_stats):
-        for i, a, j, b in pbar:
-            apply_perturbation(params, base_params, dir1, dir2, float(a), float(b))
-            loss_grid[i, j] = evaluate_classification_loss(
-                model, loader, device, cfg.mixed_precision_dtype,
-                max_batches=cfg.landscape_eval_batches)
-            pbar.set_postfix(alpha=f"{a:.2f}", beta=f"{b:.2f}", loss=f"{loss_grid[i,j]:.4f}")
+    for i, a, j, b in pbar:
+        apply_perturbation(params, base_params, dir1, dir2, float(a), float(b))
+        loss_grid[i, j] = evaluate_classification_loss(
+            model, loader, device, cfg.mixed_precision_dtype,
+            max_batches=cfg.landscape_eval_batches)
+        pbar.set_postfix(alpha=f"{a:.2f}", beta=f"{b:.2f}", loss=f"{loss_grid[i,j]:.4f}")
+
     with torch.no_grad():
         for p, p0 in zip(params, base_params):
             p.copy_(p0)
@@ -1798,7 +1510,6 @@ def compute_landscape_data(teacher_model, student_model, cfg: Config, tag: str) 
 
 
 def save_landscape_data(cfg: Config, data: dict):
-    """Luu landscape cho TUNG model rieng (de load lai gon hon)."""
     tag = data["tag"]
     for key, r in data["results"].items():
         safe_key = key.split(" ")[0].replace("-", "_").lower()
@@ -1809,19 +1520,16 @@ def save_landscape_data(cfg: Config, data: dict):
             "model_key": key, "tag": tag,
         })
 
+
 def _clip_for_display(lg: np.ndarray, low_pct: float = 1.0, high_pct: float = 90.0) -> np.ndarray:
-    """
-    Clip 2 phia theo percentile (mac dinh [1, 90]) thay vi chi clip-tren-99
-    nhu ban cu. Voi loss landscape o day, chenh lech do lon giua vung day
-    phang (O(1)-O(10)) va vai diem ngoai bien no (O(1e7)-O(1e21)) co the
-    toi vai chuc bac do lon -- chi clip-tren-99 van chua du de tranh "nuot"
-    chi tiet vung tam.
-    """
+    """Clip 2 phia theo percentile (mac dinh [1, 90]) de khong "nuot" chi
+    tiet vung tam khi vai diem ngoai bien co bien do lon hon nhieu bac."""
     lo = np.percentile(lg, low_pct)
     hi = np.percentile(lg, high_pct)
     if hi <= lo:
         hi = lg.max()
     return np.clip(lg, lo, hi)
+
 
 def _safe_lognorm(lg_clipped: np.ndarray) -> LogNorm:
     """LogNorm an toan (vmin > 0), dich nhe neu co gia tri <= 0."""
@@ -1836,6 +1544,7 @@ def _safe_lognorm(lg_clipped: np.ndarray) -> LogNorm:
         vmax = vmin * 10.0
     return LogNorm(vmin=vmin, vmax=vmax)
 
+
 def _draw_3d_axis(ax, A, B, lg, key, fig, style: PlotStyle):
     """Mau theo thang LOG; truc Z van la gia tri loss da clip (khong log)."""
     norm = _safe_lognorm(lg)
@@ -1849,7 +1558,6 @@ def _draw_3d_axis(ax, A, B, lg, key, fig, style: PlotStyle):
     mappable = plt.cm.ScalarMappable(norm=norm, cmap=style.cmap_name)
     mappable.set_array(lg)
     fig.colorbar(mappable, ax=ax, shrink=0.6, pad=0.1, label="loss (log scale)")
-
 
 
 def _draw_2d_axis(ax, A, B, lg, key, fig, style: PlotStyle):
@@ -1907,7 +1615,7 @@ def run_landscape_and_plot(teacher_model, student_model, cfg: Config, tag: str,
 
 
 # =========================================================================
-# METRIC / LOSS CURVES  (tach data vs plot, luu .json de ve lai)
+# METRIC / LOSS CURVES
 # =========================================================================
 
 def save_history_data(cfg: Config, teacher_history: List[Dict], student_history: List[Dict]):
@@ -1924,17 +1632,13 @@ def load_history_data(cfg: Config) -> dict:
 
 
 def plot_metric_curves(history: dict, cfg: Config, style: PlotStyle = DEFAULT_STYLE):
-    """
-    Accuracy/F1 vs epoch: duong "mean" (mu-forward, theta*) + vung mo
-    [min, max] (do trai hieu suat giua cac particle). history la dict dang
-    {teacher_key/student_key: [...]} -- co the la output truc tiep tu
-    training, hoac load lai tu load_history_data().
-    """
+    """Accuracy/F1 vs epoch: duong "mean" (mu-forward, theta*) + vung mo
+    [min, max] (do trai hieu suat giua cac particle)."""
     fig, axes = plt.subplots(1, 2, figsize=style.figsize_wide)
 
     for key, label, color in [
-        (history.get("teacher_key", TEACHER_KEY), "ResNet-50 teacher (BLL)", style.teacher_color),
-        (history.get("student_key", STUDENT_KEY), "ResNet-18 student (BLL+GW)", style.student_color),
+        (history.get("teacher_key", TEACHER_KEY), "ViT-Large teacher (BLL)", style.teacher_color),
+        (history.get("student_key", STUDENT_KEY), "ViT-Base student (BLL+GW)", style.student_color),
     ]:
         rows = history.get("teacher_history" if "teacher" in key.lower() else "student_history", [])
         if not rows:
@@ -1968,7 +1672,7 @@ def plot_metric_curves(history: dict, cfg: Config, style: PlotStyle = DEFAULT_ST
         ax.tick_params(labelsize=style.tick_fontsize)
         ax.grid(alpha=style.grid_alpha)
         ax.legend(fontsize=style.legend_fontsize, loc="lower right")
-    fig.suptitle("CIFAR-100 Classification: BLL Teacher (ResNet-50) vs BLL+GW Student (ResNet-18)",
+    fig.suptitle("CIFAR-100 Classification: BLL Teacher (ViT-Large) vs BLL+GW Student (ViT-Base)",
                 fontsize=style.title_fontsize, fontweight="bold")
     fig.tight_layout(rect=[0, 0, 1, 0.92])
     p = os.path.join(cfg.figure_dir, "accuracy_f1_vs_epoch.png")
@@ -1994,8 +1698,8 @@ def plot_loss_curves(history: dict, cfg: Config, style: PlotStyle = DEFAULT_STYL
     for ax, (field, title, ylabel) in zip(flat_axes, panels):
         plotted_any = False
         for label, color, rows in [
-            ("ResNet-50 teacher (BLL)", style.teacher_color, teacher_rows),
-            ("ResNet-18 student (BLL+GW)", style.student_color, student_rows),
+            ("ViT-Large teacher (BLL)", style.teacher_color, teacher_rows),
+            ("ViT-Base student (BLL+GW)", style.student_color, student_rows),
         ]:
             sub = [r for r in rows if field in r]
             if not sub:
@@ -2016,7 +1720,7 @@ def plot_loss_curves(history: dict, cfg: Config, style: PlotStyle = DEFAULT_STYL
             ax.text(0.5, 0.5, "no data", ha="center", va="center",
                    transform=ax.transAxes, fontsize=style.label_fontsize, color="gray")
 
-    fig.suptitle("Loss Components vs Epoch: BLL Teacher (ResNet-50) vs BLL+GW Student (ResNet-18)",
+    fig.suptitle("Loss Components vs Epoch: BLL Teacher (ViT-Large) vs BLL+GW Student (ViT-Base)",
                 fontsize=style.title_fontsize, fontweight="bold")
     fig.tight_layout(rect=[0, 0, 1, 0.95])
     p = os.path.join(cfg.figure_dir, "loss_curves.png")
@@ -2055,15 +1759,12 @@ def run_and_save_ood_eval(teacher_model, student_model, cfg: Config) -> dict:
 
 
 def plot_ood_eval(payload: dict, cfg: Config, style: PlotStyle = DEFAULT_STYLE):
-    """
-    Ve histogram predictive-entropy ID vs OOD cho teacher va student
-    (2 subplot), kem AUROC trong title. payload co the la output truc tiep
-    tu run_and_save_ood_eval(...) hoac load_figure_data(cfg, "ood_eval").
-    """
+    """Histogram predictive-entropy ID vs OOD cho teacher va student (2
+    subplot), kem AUROC trong title."""
     fig, axes = plt.subplots(1, 2, figsize=style.figsize_wide)
     for ax, prefix, label, color in [
-        (axes[0], "resnet_50", "ResNet-50 teacher (BLL)", style.teacher_color),
-        (axes[1], "resnet_18", "ResNet-18 student (BLL+GW)", style.student_color),
+        (axes[0], "vit_large", "ViT-Large teacher (BLL)", style.teacher_color),
+        (axes[1], "vit_base", "ViT-Base student (BLL+GW)", style.student_color),
     ]:
         id_scores  = payload.get(f"{prefix}_id_scores")
         ood_scores = payload.get(f"{prefix}_ood_scores")
@@ -2094,23 +1795,16 @@ def plot_ood_eval(payload: dict, cfg: Config, style: PlotStyle = DEFAULT_STYLE):
 
 
 # =========================================================================
-# RE-PLOT HELPER  (vi du cach ve lai TAT CA figure tu du lieu da luu,
-#                  KHONG can GPU / KHONG can chay lai training)
+# RE-PLOT HELPER  (ve lai TAT CA figure tu du lieu da luu, KHONG can GPU)
 # =========================================================================
 
 def replot_all_from_saved(cfg: Config = CFG, style: PlotStyle = DEFAULT_STYLE):
-    """
-    Doc lai toan bo du lieu da luu trong cfg.figure_data_dir va ve lai cac
-    figure chinh voi mot PlotStyle moi. Goi ham nay sau khi da chinh
-    PlotStyle (vi du tang fontsize, doi figsize) ma KHONG can chay lai
-    training hay forward model.
-    """
-    # 1) metric / loss curves
+    """Doc lai toan bo du lieu da luu trong cfg.figure_data_dir va ve lai
+    cac figure chinh voi mot PlotStyle moi, khong can chay lai training."""
     hist = load_history_data(cfg)
     plot_metric_curves(hist, cfg, style)
     plot_loss_curves(hist, cfg, style)
 
-    # 2) loss landscape (truoc va sau distill)
     for tag, title, prefix in [
         ("BEFORE", "Loss Landscape BEFORE Knowledge Distillation", "loss_landscape_BEFORE_distillation"),
         ("AFTER",  "Loss Landscape AFTER Knowledge Distillation",  "loss_landscape_AFTER_distillation"),
@@ -2126,7 +1820,6 @@ def replot_all_from_saved(cfg: Config = CFG, style: PlotStyle = DEFAULT_STYLE):
         if results:
             plot_landscapes_all({"results": results}, cfg, title=title, save_name_prefix=prefix, style=style)
 
-    # 3) OOD
     try:
         ood_payload = load_figure_data(cfg, "ood_eval")
         plot_ood_eval(ood_payload, cfg, style)
@@ -2152,7 +1845,7 @@ def main():
     print(f"Teacher epochs == Student epochs (yeu cau): "
           f"{CFG.teacher_num_epochs} == {CFG.student_num_epochs}")
 
-    teacher_ckpt_path = os.path.join(CFG.checkpoint_dir, "teacher_resnet50_bll")
+    teacher_ckpt_path = os.path.join(CFG.checkpoint_dir, "teacher_vit_large_bll")
     teacher_history: List[Dict] = []
 
     if bll_checkpoint_exists(teacher_ckpt_path):
@@ -2160,10 +1853,10 @@ def main():
     else:
         if CFG.run_pre_landscape:
             print("\n>>> STEP 1: Loss landscape BEFORE distillation (random/pretrained init) <<<")
-            t_fresh = BLLCNNClassifier.from_torchvision_name(
+            t_fresh = BLLViTClassifier.from_timm_name(
                 CFG.teacher_name, CFG.num_labels, CFG.teacher_pretrained,
                 CFG.prior_std, CFG.init_log_sigma)
-            s_fresh = BLLCNNClassifier.from_torchvision_name(
+            s_fresh = BLLViTClassifier.from_timm_name(
                 CFG.student_name, CFG.num_labels, CFG.student_pretrained,
                 CFG.prior_std, CFG.init_log_sigma)
             run_landscape_and_plot(
@@ -2176,11 +1869,11 @@ def main():
                 torch.cuda.empty_cache()
 
         if CFG.run_teacher_fit:
-            print(f"\n>>> STEP 2: Fitting teacher BLL on pretrained ResNet-50 "
+            print(f"\n>>> STEP 2: Fitting teacher BLL on pretrained ViT-Large "
                   f"({CFG.teacher_num_epochs} epochs, = student_num_epochs) <<<")
             teacher_ckpt_path, teacher_history = fit_teacher(CFG)
 
-    student_ckpt_path = os.path.join(CFG.checkpoint_dir, "student_resnet18_bll_gw")
+    student_ckpt_path = os.path.join(CFG.checkpoint_dir, "student_vit_base_bll_gw")
     student_history: List[Dict] = []
 
     if CFG.run_distillation:
