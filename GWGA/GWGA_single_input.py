@@ -259,11 +259,11 @@ class Config:
     ood_score_type: str = "predictive_entropy"
 
     # ── Output ────────────────────────────────────────────────────────────
-    output_dir: str = "/mnt/vis/output_resnet_cifar_bll_gw"
-    checkpoint_dir: str = "/mnt/vis/output_resnet_cifar_bll_gw/checkpoints"
-    figure_dir: str = "/mnt/vis/output_resnet_cifar_bll_gw/figures"
-    figure_data_dir: str = "/mnt/vis/output_resnet_cifar_bll_gw/figure_data"  # .npz/.json tho
-    log_file: str = "/mnt/vis/output_resnet_cifar_bll_gw/train_log.jsonl"
+    output_dir: str = "../output_resnet_cifar_bll_gw"
+    checkpoint_dir: str = "../output_resnet_cifar_bll_gw/checkpoints"
+    figure_dir: str = "../output_resnet_cifar_bll_gw/figures"
+    figure_data_dir: str = "../output_resnet_cifar_bll_gw/figure_data"  # .npz/.json tho
+    log_file: str = "../output_resnet_cifar_bll_gw/train_log.jsonl"
 
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     seed: int = 1234
