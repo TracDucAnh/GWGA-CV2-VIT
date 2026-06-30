@@ -22,9 +22,11 @@ Cau truc output:
         coarse_classes.txt   ten 20 superclass
 
 Su dung:
-    python download_cifar.py                  # tai ca 2 bo
+    python download_cifar.py                  # tai ca 2 bo (mac dinh 8 luong song song)
     python download_cifar.py --which cifar10   # chi tai CIFAR-10
     python download_cifar.py --which cifar100  # chi tai CIFAR-100
+    python download_cifar.py --connections 16  # tang so luong de tai nhanh hon
+    python download_cifar.py --connections 1   # tai tuan tu (1 luong) neu mang khong on dinh
     python download_cifar.py --keep-raw        # giu lai file .tar.gz / file giai nen
 """
 
@@ -33,11 +35,15 @@ import hashlib
 import pickle
 import shutil
 import tarfile
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import numpy as np
 import requests
+from requests.adapters import HTTPAdapter
 from tqdm import tqdm
+from urllib3.util.retry import Retry
 
 # ---------------------------------------------------------------------------
 # Cau hinh duong dan & nguon tai
@@ -67,32 +73,106 @@ def md5_of_file(path: Path, chunk_size: int = 1 << 20) -> str:
     return h.hexdigest()
 
 
-def download_file(url: str, dest_path: Path, expected_md5: str, chunk_size: int = 1 << 16) -> None:
-    """Tai file ve dest_path, hien thi tien trinh bang tqdm."""
+def _make_session() -> requests.Session:
+    """Session co retry/backoff de chiu duoc duong truyen cham/chap chon."""
+    session = requests.Session()
+    retries = Retry(
+        total=5, connect=5, read=5, backoff_factor=1.5,
+        status_forcelist=[429, 500, 502, 503, 504],
+    )
+    adapter = HTTPAdapter(max_retries=retries, pool_maxsize=32)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session
+
+
+def _download_segment(session: requests.Session, url: str, dest_path: Path,
+                       start: int, end: int, bar: tqdm, lock: threading.Lock,
+                       chunk_size: int) -> None:
+    headers = {"Range": f"bytes={start}-{end}"}
+    with session.get(url, headers=headers, stream=True, timeout=(15, 60)) as resp:
+        resp.raise_for_status()
+        with open(dest_path, "r+b") as f:
+            f.seek(start)
+            for chunk in resp.iter_content(chunk_size=chunk_size):
+                if chunk:
+                    f.write(chunk)
+                    with lock:
+                        bar.update(len(chunk))
+
+
+def _download_sequential(session: requests.Session, url: str, dest_path: Path,
+                          chunk_size: int) -> None:
+    """Tai tuan tu mot luong duy nhat (dung khi server khong ho tro Range)."""
+    with session.get(url, stream=True, timeout=(15, 60)) as response:
+        response.raise_for_status()
+        total = int(response.headers.get("content-length", 0))
+        with open(dest_path, "wb") as f, tqdm(
+            total=total, unit="B", unit_scale=True, unit_divisor=1024,
+            desc=f"Downloading {dest_path.name}",
+        ) as bar:
+            for chunk in response.iter_content(chunk_size=chunk_size):
+                if chunk:
+                    f.write(chunk)
+                    bar.update(len(chunk))
+
+
+def download_file(url: str, dest_path: Path, expected_md5: str,
+                   num_connections: int = 8, chunk_size: int = 1 << 16) -> None:
+    """Tai file ve dest_path. Mac dinh tai song song nhieu luong (Range request)
+    de tang toc khi server gioi han bang thong tren tung ket noi; tu dong fallback
+    ve tai tuan tu neu server khong ho tro Range hoac chi dung 1 luong."""
     if dest_path.exists():
         if md5_of_file(dest_path) == expected_md5:
             print(f"[skip] {dest_path.name} da ton tai va dung checksum.")
             return
         print(f"[warn] {dest_path.name} ton tai nhung sai checksum, tai lai.")
+        dest_path.unlink()
 
     dest_path.parent.mkdir(parents=True, exist_ok=True)
-    response = requests.get(url, stream=True, timeout=30)
-    response.raise_for_status()
-    total = int(response.headers.get("content-length", 0))
+    session = _make_session()
 
-    with open(dest_path, "wb") as f, tqdm(
-        total=total, unit="B", unit_scale=True, unit_divisor=1024,
-        desc=f"Downloading {dest_path.name}",
-    ) as bar:
-        for chunk in response.iter_content(chunk_size=chunk_size):
-            if chunk:
-                f.write(chunk)
-                bar.update(len(chunk))
+    total, supports_range = 0, False
+    try:
+        head = session.head(url, allow_redirects=True, timeout=(15, 30))
+        total = int(head.headers.get("content-length", 0))
+        supports_range = head.headers.get("accept-ranges", "").lower() == "bytes"
+    except requests.RequestException:
+        pass  # se fallback ve tai tuan tu ben duoi
+
+    if num_connections <= 1 or not supports_range or total == 0:
+        _download_sequential(session, url, dest_path, chunk_size)
+    else:
+        # cap phat truoc dung dung tong dung luong de cac luong ghi vao dung vi tri
+        with open(dest_path, "wb") as f:
+            f.truncate(total)
+
+        segment_size = total // num_connections
+        ranges = []
+        for i in range(num_connections):
+            start = i * segment_size
+            end = total - 1 if i == num_connections - 1 else start + segment_size - 1
+            ranges.append((start, end))
+
+        lock = threading.Lock()
+        with tqdm(
+            total=total, unit="B", unit_scale=True, unit_divisor=1024,
+            desc=f"Downloading {dest_path.name} ({num_connections} luong)",
+        ) as bar:
+            with ThreadPoolExecutor(max_workers=num_connections) as executor:
+                futures = [
+                    executor.submit(_download_segment, session, url, dest_path,
+                                     start, end, bar, lock, chunk_size)
+                    for start, end in ranges
+                ]
+                for fut in as_completed(futures):
+                    fut.result()  # raise lai loi neu co luong nao fail
 
     actual_md5 = md5_of_file(dest_path)
     if actual_md5 != expected_md5:
         print(f"[warn] checksum khong khop cho {dest_path.name} "
-              f"(expected {expected_md5}, got {actual_md5}). File van duoc giu lai.")
+              f"(expected {expected_md5}, got {actual_md5}). File van duoc giu lai, "
+              f"kiem tra lai duong truyen mang neu giai nen loi.")
 
 
 def extract_archive(archive_path: Path, extract_to: Path) -> Path:
@@ -182,6 +262,9 @@ def main() -> None:
     parser.add_argument("--which", choices=["cifar10", "cifar100", "both"], default="both")
     parser.add_argument("--keep-raw", action="store_true",
                          help="Giu lai file .tar.gz va thu muc giai nen trong dataset/_raw")
+    parser.add_argument("--connections", type=int, default=8,
+                         help="So luong ket noi song song khi tai file (mac dinh 8, "
+                              "dat = 1 de tai tuan tu)")
     args = parser.parse_args()
 
     RAW_DIR.mkdir(parents=True, exist_ok=True)
@@ -195,7 +278,7 @@ def main() -> None:
     for name, url, md5, out_dir, process_fn in targets:
         print(f"\n=== {name.upper()} ===")
         archive_path = RAW_DIR / Path(url).name
-        download_file(url, archive_path, md5)
+        download_file(url, archive_path, md5, num_connections=args.connections)
         extracted_root = extract_archive(archive_path, RAW_DIR)
         process_fn(extracted_root, out_dir)
 
