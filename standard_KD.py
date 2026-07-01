@@ -160,12 +160,14 @@ class Config:
     teacher_backbone_lr_mult: float = 0.1   # backbone lr = learning_rate * mult
 
     # ── Student distillation ─────────────────────────────────────────────
-    student_num_epochs: int = 30
+    student_num_epochs: int = 10
     phase1_frac: float = 0     # ti le epoch DAU chi train CE (khong KD)
     kd_alpha_max: float = 1.0     # trong so toi da cua soft-target KD loss (sau phase1)
 
     # ── Optimization ──────────────────────────────────────────────────────
     learning_rate: float = 5e-5
+    student_learning_rate: float = 1e-3
+    student_head_lr_mult: float = 1.0
     weight_decay: float = 0.01
     warmup_ratio: float = 0.03
     max_grad_norm: float = 1.0
@@ -1047,7 +1049,11 @@ def distill_student(cfg: Config, teacher_ckpt_path: str, teacher_model_for_umap:
 
     train_loader, eval_loader = build_cifar100_loaders(cfg, cfg.distill_batch_size)
 
-    optimizer    = torch.optim.AdamW(student.parameters(), lr=cfg.learning_rate, weight_decay=cfg.weight_decay)
+    param_groups = [
+        {"params": student.backbone.parameters(), "lr": cfg.student_learning_rate},
+        {"params": student.head.parameters(),     "lr": cfg.student_learning_rate * cfg.student_head_lr_mult},
+    ]
+    optimizer = torch.optim.AdamW(param_groups, weight_decay=cfg.weight_decay)
     total_steps  = (len(train_loader) // cfg.gradient_accumulation_steps) * cfg.student_num_epochs
     warmup_steps = int(total_steps * cfg.warmup_ratio)
     scheduler    = torch.optim.lr_scheduler.LambdaLR(
