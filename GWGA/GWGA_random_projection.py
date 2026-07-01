@@ -1129,7 +1129,7 @@ def evaluate_ood_auroc(model: BLLViTClassifier, id_loader, ood_loader, cfg: Conf
 # loss tai theta* HIEN TAI (KHONG perturb).
 # =========================================================================
 
-def compute_hessian_trace(model: ViTClassifier, params: List[torch.Tensor],
+def compute_hessian_trace(model: BLLViTClassifier, params: List[torch.Tensor],
                           images: torch.Tensor, labels: torch.Tensor,
                           num_hutchinson_samples: int, seed: Optional[int] = None) -> float:
     # SDPA backend "efficient"/"flash" (mac dinh cua timm ViT) KHONG ho tro
