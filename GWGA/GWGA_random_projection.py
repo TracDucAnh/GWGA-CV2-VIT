@@ -193,7 +193,7 @@ class Config:
     # YEU CAU: so epoch fit teacher = so epoch distill student -> gan o
     # ngay sau khi tao CFG (xem duoi class Config).
     teacher_num_epochs: int = 10
-    teacher_kl_beta_max: float = 1.0
+    teacher_kl_beta_max: float = 0.1
     teacher_kl_warmup_frac: float = 0.1
     teacher_finetune_backbone: bool = True
     teacher_backbone_lr_mult: float = 0.1   # backbone lr = learning_rate * mult
@@ -203,7 +203,7 @@ class Config:
     phase1_frac: float = 0.3
     phase2_frac: float = 0.3
     phase3_frac: float = 0.4
-    kl_beta_max: float = 1.0
+    kl_beta_max: float = 0.1
     gw_gamma_max: float = 1.0
 
     # ── Optimization ──────────────────────────────────────────────────────
@@ -215,8 +215,8 @@ class Config:
     max_grad_norm: float = 1.0
     mixed_precision_dtype: torch.dtype = torch.bfloat16
 
-    batch_size: int = 64
-    distill_batch_size: int = 32
+    batch_size: int = 512
+    distill_batch_size: int = 256
     gradient_accumulation_steps: int = 1
     use_gradient_checkpointing: bool = True   # timm ViT ho tro set_grad_checkpointing()
 
