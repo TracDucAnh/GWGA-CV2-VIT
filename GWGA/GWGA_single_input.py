@@ -188,9 +188,9 @@ class Config:
     umap_seed: int = 42
 
     # ── Loss landscape ───────────────────────────────────────────────────
-    landscape_grid_size: int = 20
-    landscape_alpha_range: Tuple[float, float] = (-3.0, 3.0)
-    landscape_beta_range: Tuple[float, float] = (-3.0, 3.0)
+    landscape_grid_size: int = 15
+    landscape_alpha_range: Tuple[float, float] = (-2.0, 2.0)
+    landscape_beta_range: Tuple[float, float] = (-2.0, 2.0)
     landscape_eval_batches: int = 10
     landscape_eval_batch_size: int = 16
     landscape_seed: int = 42
