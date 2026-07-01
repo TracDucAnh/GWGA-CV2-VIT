@@ -183,7 +183,7 @@ class Config:
     phase1_frac: float = 0.3
     phase2_frac: float = 0.3
     phase3_frac: float = 0.4
-    kl_beta_max: float = 1
+    kl_beta_max: float = 1.0
     gw_gamma_max: float = 1.0
 
     # ── Optimization ──────────────────────────────────────────────────────
@@ -208,7 +208,7 @@ class Config:
     gw_epsilon: float = 0.1
     gw_sinkhorn_iters: int = 30
     gw_outer_iters: int = 10
-    gw_distance: str = "sqeuclidean"     # "sqeuclidean" | "cosine"
+    gw_distance: str = "cosine"     # "sqeuclidean" | "cosine"
 
     # ── Random projection augmentation (Sec 5.3 cua paper) ────────────────
     # Remedy thay the cho batch-pooled cost matrix (Algorithm 2) de "vá"
