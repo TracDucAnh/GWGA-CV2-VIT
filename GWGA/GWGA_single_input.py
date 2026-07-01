@@ -177,8 +177,8 @@ class Config:
     use_gradient_checkpointing: bool = True   # timm ViT ho tro set_grad_checkpointing()
 
     # ── Bayesian Last Layer ──────────────────────────────────────────────
-    num_particles: int = 16
-    eval_num_particles: int = 16
+    num_particles: int = 8
+    eval_num_particles: int = 8
     prior_std: float = 1.0
     init_log_sigma: float = -2.3
 
@@ -1011,7 +1011,14 @@ def compute_hessian_trace(model: BLLViTClassifier, params: List[torch.Tensor],
     with _SDPA_MATH_CTX():
         logits = model.forward_mean(images)
         loss = F.cross_entropy(logits.float(), labels)
-        first_grads = torch.autograd.grad(loss, params, create_graph=True)
+        # forward_mean() chi dung mu (F.linear(h, self.mu)) -- cac param
+        # KHONG tham gia graph cua loss nay (vd: BLL log_sigma, chi dung
+        # trong forward() day du khi sample particles) se co grad = None.
+        # Loai bo truoc khi Hutchinson, thay vi crash o day.
+        raw_grads = torch.autograd.grad(loss, params, create_graph=True, allow_unused=True)
+        kept = [(p, g) for p, g in zip(params, raw_grads) if g is not None]
+        params = [p for p, _ in kept]
+        first_grads = [g for _, g in kept]
 
         gen = torch.Generator()
         if seed is not None:
