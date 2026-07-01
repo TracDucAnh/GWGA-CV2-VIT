@@ -164,7 +164,7 @@ class Config:
 
     # ── Optimization ──────────────────────────────────────────────────────
     learning_rate: float = 5e-5
-    student_learning_rate: float = 1e-3
+    student_learning_rate: float = 1e-4
     student_head_lr_mult: float = 1.0
     weight_decay: float = 0.01
     warmup_ratio: float = 0.03
