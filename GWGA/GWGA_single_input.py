@@ -246,8 +246,6 @@ class Config:
 
 
 CFG = Config()
-# YEU CAU 1: teacher duoc fit voi so epoch BANG so epoch distill student.
-CFG.teacher_num_epochs = CFG.student_num_epochs
 
 TEACHER_KEY = "ViT-Large (teacher, BLL)"
 STUDENT_KEY = "ViT-Small (student, BLL+GW)"
@@ -1011,7 +1009,7 @@ def compute_hessian_trace(model: ViTClassifier, params: List[torch.Tensor],
     # double backward -- can ep dung backend "math" (thuan matrix multiply)
     # trong suot qua trinh tinh ca forward LAN 2 lan backward (bac 1 + bac 2).
     with _SDPA_MATH_CTX():
-        logits = model(images)
+        logits = model.forward_mean(images)
         loss = F.cross_entropy(logits.float(), labels)
         first_grads = torch.autograd.grad(loss, params, create_graph=True)
 

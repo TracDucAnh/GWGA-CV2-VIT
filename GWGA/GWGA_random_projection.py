@@ -299,8 +299,6 @@ class Config:
 
 
 CFG = Config()
-# YEU CAU 1: teacher duoc fit voi so epoch BANG so epoch distill student.
-CFG.teacher_num_epochs = CFG.student_num_epochs
 # r = rp_dim_multiplier * C (C = num_labels), theo sweep r in {C,4C,16C}
 # cua ablation 6 trong paper (Sec 6.4, item 6). r=0 <=> use_random_projection=False.
 CFG.rp_dim = (CFG.rp_dim_multiplier * CFG.num_labels) if CFG.use_random_projection else 0
@@ -1138,7 +1136,7 @@ def compute_hessian_trace(model: ViTClassifier, params: List[torch.Tensor],
     # double backward -- can ep dung backend "math" (thuan matrix multiply)
     # trong suot qua trinh tinh ca forward LAN 2 lan backward (bac 1 + bac 2).
     with _SDPA_MATH_CTX():
-        logits = model(images)
+        logits = model.forward_mean(images)
         loss = F.cross_entropy(logits.float(), labels)
         first_grads = torch.autograd.grad(loss, params, create_graph=True)
 

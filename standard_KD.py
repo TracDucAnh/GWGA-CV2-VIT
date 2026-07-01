@@ -253,8 +253,6 @@ class Config:
 
 
 CFG = Config()
-# YEU CAU 1: teacher duoc fit voi so epoch BANG so epoch distill student.
-CFG.teacher_num_epochs = CFG.student_num_epochs
 
 TEACHER_KEY = "ViT-Large (teacher)"
 STUDENT_KEY = "ViT-Small (student, KD)"
