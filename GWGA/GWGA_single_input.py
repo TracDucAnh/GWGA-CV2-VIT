@@ -151,7 +151,7 @@ class Config:
     phase1_frac: float = 0.3
     phase2_frac: float = 0.3
     phase3_frac: float = 0.4
-    kl_beta_max: float = 0.1
+    kl_beta_max: float = 1
     gw_gamma_max: float = 1.0
 
     # ── Optimization ──────────────────────────────────────────────────────
