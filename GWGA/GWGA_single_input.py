@@ -152,7 +152,7 @@ class Config:
     teacher_backbone_epochs: int = 10
     teacher_bll_epochs: int = 5
     teacher_kl_beta_max: float = 0.1
-    teacher_kl_warmup_frac: float = 0.5
+    teacher_kl_warmup_frac: float = 0.3
     teacher_finetune_backbone: bool = True
     teacher_backbone_lr_mult: float = 1   # backbone lr = learning_rate * mult
 
@@ -220,8 +220,14 @@ class Config:
     ece_num_bins: int = 15
 
     # ── Hessian-trace sharpness (necessary-condition gap, Proposition 5.3) ─
-    hessian_num_hutchinson_samples: int = 10
-    hessian_eval_batches: int = 5
+    # 10 samples x 5 batches = 50 probe vectors tong cong la qua it cho mot
+    # mang ~300M tham so (ViT-Large full backbone + head.mu) -> uoc luong
+    # Hutchinson co variance rat lon, du dau (+/-) cung khong dang tin cay.
+    # Tang len 20 x 10 = 200 probe vectors (4x) de CI hep lai; kem theo
+    # do std/CI o evaluate_hessian_trace_sharpness() de biet uoc luong co
+    # dang tin hay khong, thay vi chi nhin gia tri trung binh.
+    hessian_num_hutchinson_samples: int = 20
+    hessian_eval_batches: int = 10
     hessian_seed: int = 777
 
     # ── OOD evaluation (CIFAR-10 dung lam OOD cho model train tren CIFAR-100) ─
@@ -1024,7 +1030,7 @@ def evaluate_ood_auroc(model: BLLViTClassifier, id_loader, ood_loader, cfg: Conf
 
 def compute_hessian_trace(model: BLLViTClassifier, params: List[torch.Tensor],
                           images: torch.Tensor, labels: torch.Tensor,
-                          num_hutchinson_samples: int, seed: Optional[int] = None) -> float:
+                          num_hutchinson_samples: int, seed: Optional[int] = None) -> List[float]:
     # SDPA backend "efficient"/"flash" (mac dinh cua timm ViT) KHONG ho tro
     # double backward -- can ep dung backend "math" (thuan matrix multiply)
     # trong suot qua trinh tinh ca forward LAN 2 lan backward (bac 1 + bac 2).
@@ -1055,15 +1061,26 @@ def compute_hessian_trace(model: BLLViTClassifier, params: List[torch.Tensor],
             hv = torch.autograd.grad(dot, params, retain_graph=retain)
             trace_est = sum((h * v).sum().item() for h, v in zip(hv, vecs))
             trace_samples.append(trace_est)
-    return float(np.mean(trace_samples))
+    # Tra ve RAW samples (khong average o day nua) -- averaging + std/CI
+    # duoc lam o evaluate_hessian_trace_sharpness(), tren toan bo
+    # num_hutchinson_samples x eval_batches probe vectors, de phuong sai
+    # bao cao dung voi so luong mau THUC SU da dung.
+    return trace_samples
 
 
 def evaluate_hessian_trace_sharpness(model: BLLViTClassifier, loader, cfg: Config,
-                                     seed: Optional[int] = None) -> float:
+                                     seed: Optional[int] = None) -> Dict[str, float]:
     """
-    Uoc luong Hessian-trace sharpness cua model HIEN TAI, trung binh qua
+    Uoc luong Hessian-trace sharpness cua model HIEN TAI qua
     cfg.hessian_eval_batches batch co dinh (thuong la build_landscape_loader(cfg))
-    va cfg.hessian_num_hutchinson_samples vector Rademacher moi batch.
+    x cfg.hessian_num_hutchinson_samples vector Rademacher moi batch.
+
+    Tra ve dict {"mean", "std", "sem", "ci95", "n_samples"} thay vi 1 con
+    so duy nhat: Hutchinson la mot estimator NGAU NHIEN, voi mang lon
+    (vd ViT-Large full backbone) phuong sai co the rat lon so voi vai chuc
+    mau, nen dau (+/-) cua "mean" khong dang tin neu ci95 >> |mean|.
+    "std" la do lech chuan cua tung probe (v^T H v), "sem"/"ci95" la sai
+    so chuan / khoang tin cay 95% CUA UOC LUONG TRUNG BINH (sem = std/sqrt(n)).
 
     Can GRADIENT BAC 2 (double backprop) nen KHONG duoc goi duoi
     torch.no_grad(). Chay o FULL PRECISION (khong autocast) vi double
@@ -1076,23 +1093,33 @@ def evaluate_hessian_trace_sharpness(model: BLLViTClassifier, loader, cfg: Confi
     model.eval()
     params = [p for p in model.parameters() if p.requires_grad]
 
-    batch_traces = []
+    all_samples: List[float] = []
     for i, (images, labels) in enumerate(loader):
         if i >= cfg.hessian_eval_batches:
             break
         images = images.to(cfg.device, non_blocking=True)
         labels = labels.to(cfg.device, non_blocking=True)
         batch_seed = None if seed is None else seed + i
-        t = compute_hessian_trace(
+        batch_samples = compute_hessian_trace(
             model, params, images, labels,
             num_hutchinson_samples=cfg.hessian_num_hutchinson_samples,
             seed=batch_seed,
         )
-        batch_traces.append(t)
+        all_samples.extend(batch_samples)
 
     if was_training:
         model.train()
-    return float(np.mean(batch_traces)) if batch_traces else float("nan")
+
+    if not all_samples:
+        return {"mean": float("nan"), "std": float("nan"), "sem": float("nan"),
+                "ci95": float("nan"), "n_samples": 0}
+
+    arr = np.asarray(all_samples, dtype=np.float64)
+    n = int(arr.size)
+    mean = float(arr.mean())
+    std = float(arr.std(ddof=1)) if n > 1 else 0.0
+    sem = std / np.sqrt(n) if n > 0 else float("nan")
+    return {"mean": mean, "std": std, "sem": sem, "ci95": 1.96 * sem, "n_samples": n}
 
 
 # =========================================================================
@@ -1129,6 +1156,7 @@ def fit_teacher(cfg: Config) -> Tuple[str, List[Dict]]:
     history: List[Dict] = []
     model.train()
     global_step = 0
+    global_epoch = 0  # cumulative epoch counter across stages (for plotting on a single x-axis)
     latest_ckpt_path = os.path.join(cfg.checkpoint_dir, "teacher_vit_large_bll_latest")
 
     stage_specs = [
@@ -1169,6 +1197,7 @@ def fit_teacher(cfg: Config) -> Tuple[str, List[Dict]]:
         print(f"[teacher stage] name={stage_name}  epochs={num_epochs}  backbone_trainable={stage_kind == 'backbone'}")
         epoch_pbar = tqdm(range(1, num_epochs + 1), desc=f"teacher {stage_name}", unit="epoch")
         for epoch in epoch_pbar:
+            global_epoch += 1
             epoch_ce, epoch_kl, epoch_kl_term, epoch_total, n_steps = 0.0, 0.0, 0.0, 0.0, 0
             t0 = time.time()
             optimizer.zero_grad(set_to_none=True)
@@ -1253,7 +1282,7 @@ def fit_teacher(cfg: Config) -> Tuple[str, List[Dict]]:
                                    sig_m=f"{s['sigma_mean']:.4f}")
 
             record = {
-                "model": "teacher", "epoch": epoch, "stage": stage_name,
+                "model": "teacher", "epoch": global_epoch, "stage_epoch": epoch, "stage": stage_name,
                 "ce_loss": avg_ce, "kl_raw": avg_kl, "kl_term": avg_kl_term,
                 "total_loss": avg_total, "eval_loss": metrics["loss"],
                 "accuracy": metrics["accuracy"], "f1": metrics["f1"],
@@ -1265,7 +1294,8 @@ def fit_teacher(cfg: Config) -> Tuple[str, List[Dict]]:
             }
             log_jsonl(cfg.log_file, record)
             history.append({
-                "epoch": epoch, "stage": stage_name, "accuracy": metrics["accuracy"], "f1": metrics["f1"],
+                "epoch": global_epoch, "stage_epoch": epoch, "stage": stage_name,
+                "accuracy": metrics["accuracy"], "f1": metrics["f1"],
                 "accuracy_mean": metrics["accuracy_mean"], "accuracy_max": metrics["accuracy_max"],
                 "accuracy_min": metrics["accuracy_min"], "f1_mean": metrics["f1_mean"],
                 "f1_max": metrics["f1_max"], "f1_min": metrics["f1_min"],
@@ -1337,6 +1367,7 @@ def distill_student(cfg: Config, teacher_ckpt_path: str, teacher_model_for_umap:
     history: List[Dict] = []
     student.train()
     global_step = 0
+    global_epoch = 0  # cumulative epoch counter across stages (for plotting on a single x-axis)
     latest_ckpt_path = os.path.join(cfg.checkpoint_dir, "student_vit_small_bll_gw_latest")
 
     stage_specs = [
@@ -1380,6 +1411,7 @@ def distill_student(cfg: Config, teacher_ckpt_path: str, teacher_model_for_umap:
         print(f"[student stage] name={stage_name}  epochs={num_epochs}  beta_kl={beta_kl:.3f}  gamma={gamma:.3f}")
         epoch_pbar = tqdm(range(1, num_epochs + 1), desc=f"student {stage_name}", unit="epoch")
         for epoch in epoch_pbar:
+            global_epoch += 1
             epoch_ce, epoch_kl, epoch_gw, n_steps = 0.0, 0.0, 0.0, 0
             epoch_kl_term, epoch_gw_term, epoch_total = 0.0, 0.0, 0.0
             t0 = time.time()
@@ -1482,7 +1514,8 @@ def distill_student(cfg: Config, teacher_ckpt_path: str, teacher_model_for_umap:
                                    test_acc=f"{metrics['accuracy']:.4f}", sig_m=f"{s['sigma_mean']:.4f}")
 
             record = {
-                "model": "student", "epoch": epoch, "stage": stage_name, "phase": stage_name,
+                "model": "student", "epoch": global_epoch, "stage_epoch": epoch,
+                "stage": stage_name, "phase": stage_name,
                 "beta_kl": beta_kl, "gamma": gamma, "ce_loss": avg_ce, "kl_raw": avg_kl,
                 "gw_loss": avg_gw, "kl_term": avg_kl_term, "gw_term": avg_gw_term,
                 "total_loss": avg_total, "eval_loss": metrics["loss"],
@@ -1495,7 +1528,8 @@ def distill_student(cfg: Config, teacher_ckpt_path: str, teacher_model_for_umap:
             }
             log_jsonl(cfg.log_file, record)
             history.append({
-                "epoch": epoch, "stage": stage_name, "accuracy": metrics["accuracy"], "f1": metrics["f1"],
+                "epoch": global_epoch, "stage_epoch": epoch, "stage": stage_name,
+                "accuracy": metrics["accuracy"], "f1": metrics["f1"],
                 "accuracy_mean": metrics["accuracy_mean"], "accuracy_max": metrics["accuracy_max"],
                 "accuracy_min": metrics["accuracy_min"], "f1_mean": metrics["f1_mean"],
                 "f1_max": metrics["f1_max"], "f1_min": metrics["f1_min"],
@@ -1761,6 +1795,7 @@ def plot_metric_curves(history: dict, cfg: Config, style: PlotStyle = DEFAULT_ST
         rows = history.get("teacher_history" if "teacher" in key.lower() else "student_history", [])
         if not rows:
             continue
+        rows = sorted(rows, key=lambda r: r["epoch"])  # epoch = global_epoch, cumulative qua cac stage
         epochs = [r["epoch"] for r in rows]
 
         acc_mean = [r["accuracy_mean"] for r in rows]
@@ -1800,6 +1835,20 @@ def plot_metric_curves(history: dict, cfg: Config, style: PlotStyle = DEFAULT_ST
     print(f"[saved figure] {p}")
 
 
+def _stage_boundaries(rows: List[Dict]) -> List[Tuple[int, str]]:
+    """Tra ve [(global_epoch, stage_name), ...] tai moi diem BAT DAU cua
+    mot stage moi (bo qua stage dau tien), dua theo thu tu xuat hien
+    trong `rows` (rows phai da duoc sort theo 'epoch' tang dan)."""
+    boundaries = []
+    prev_stage = None
+    for r in rows:
+        stage = r.get("stage")
+        if stage is not None and stage != prev_stage and prev_stage is not None:
+            boundaries.append((r["epoch"], stage))
+        prev_stage = stage
+    return boundaries
+
+
 def plot_loss_curves(history: dict, cfg: Config, style: PlotStyle = DEFAULT_STYLE):
     panels = [
         ("total_loss", "Total Loss vs Epoch", "Total loss"),
@@ -1810,8 +1859,12 @@ def plot_loss_curves(history: dict, cfg: Config, style: PlotStyle = DEFAULT_STYL
     fig, axes = plt.subplots(2, 2, figsize=style.figsize_grid2x2)
     flat_axes = axes.reshape(-1)
 
-    teacher_rows = history.get("teacher_history", [])
-    student_rows = history.get("student_history", [])
+    # NOTE: 'epoch' o day la global_epoch (cumulative qua cac stage:
+    # backbone -> bll_elbo [-> bll_elbo_gw]), duoc ghi boi fit_teacher /
+    # distill_student. Sort phong thu de dam bao duong ve khong bi noi
+    # nguoc neu rows vi ly do gi do khong theo dung thu tu chen.
+    teacher_rows = sorted(history.get("teacher_history", []), key=lambda r: r["epoch"])
+    student_rows = sorted(history.get("student_history", []), key=lambda r: r["epoch"])
 
     for ax, (field, title, ylabel) in zip(flat_axes, panels):
         plotted_any = False
@@ -1827,6 +1880,13 @@ def plot_loss_curves(history: dict, cfg: Config, style: PlotStyle = DEFAULT_STYL
             ax.plot(epochs, vals, marker="o", markersize=style.marker_size,
                     linewidth=style.line_width, label=label, color=color)
             plotted_any = True
+
+            # Vach dut danh dau ranh gioi stage (backbone/bll/gw) de phan
+            # biet voi bien dong loss thuc su trong cung mot stage.
+            for boundary_epoch, stage_name in _stage_boundaries(rows):
+                ax.axvline(boundary_epoch - 0.5, color=color, linestyle="--",
+                          alpha=0.35, linewidth=1.0, zorder=0)
+
         ax.set_title(title, fontsize=style.subtitle_fontsize)
         ax.set_xlabel("Epoch", fontsize=style.label_fontsize)
         ax.set_ylabel(ylabel, fontsize=style.label_fontsize)
@@ -1888,30 +1948,43 @@ def run_and_save_ood_eval(teacher_model, student_model, cfg: Config) -> dict:
         print(f"[Hessian] Estimating {key} Hessian-trace sharpness "
               f"({cfg.hessian_num_hutchinson_samples} Hutchinson samples x "
               f"{cfg.hessian_eval_batches} batches) ...")
-        r["hessian_trace"] = evaluate_hessian_trace_sharpness(
+        h_stats = evaluate_hessian_trace_sharpness(
             model, landscape_loader, cfg, seed=cfg.hessian_seed)
-        print(f"[Hessian] {key}: Tr(H) ~= {r['hessian_trace']:.4f}")
+        r["hessian_trace"]      = h_stats["mean"]
+        r["hessian_trace_std"]  = h_stats["std"]
+        r["hessian_trace_sem"]  = h_stats["sem"]
+        r["hessian_trace_ci95"] = h_stats["ci95"]
+        r["hessian_trace_n"]    = h_stats["n_samples"]
+        reliable = abs(r["hessian_trace"]) > r["hessian_trace_ci95"]
+        print(f"[Hessian] {key}: Tr(H) ~= {r['hessian_trace']:.4f} "
+              f"+/- {r['hessian_trace_ci95']:.4f} (95% CI, n={r['hessian_trace_n']} probes, "
+              f"std={r['hessian_trace_std']:.4f})"
+              f"{'' if reliable else '  [CI 95% bao gom 0 -- dau (+/-) cua Tr(H) chua du tin cay]'}")
 
         results[key] = r
 
     payload = {}
     for key, r in results.items():
         safe_key = key.split(" ")[0].replace("-", "_").lower()
-        payload[f"{safe_key}_id_scores"]     = np.array(r["id_scores"])
-        payload[f"{safe_key}_ood_scores"]    = np.array(r["ood_scores"])
-        payload[f"{safe_key}_auroc"]         = r["auroc"]
-        payload[f"{safe_key}_ece"]           = r["ece"]
-        payload[f"{safe_key}_ece_mean"]      = r["ece_mean"]
-        payload[f"{safe_key}_hessian_trace"] = r["hessian_trace"]
-        payload[f"{safe_key}_model_key"]     = key
+        payload[f"{safe_key}_id_scores"]          = np.array(r["id_scores"])
+        payload[f"{safe_key}_ood_scores"]         = np.array(r["ood_scores"])
+        payload[f"{safe_key}_auroc"]              = r["auroc"]
+        payload[f"{safe_key}_ece"]                = r["ece"]
+        payload[f"{safe_key}_ece_mean"]           = r["ece_mean"]
+        payload[f"{safe_key}_hessian_trace"]      = r["hessian_trace"]
+        payload[f"{safe_key}_hessian_trace_std"]  = r["hessian_trace_std"]
+        payload[f"{safe_key}_hessian_trace_ci95"] = r["hessian_trace_ci95"]
+        payload[f"{safe_key}_hessian_trace_n"]    = r["hessian_trace_n"]
+        payload[f"{safe_key}_model_key"]          = key
     save_figure_data(cfg, "ood_eval", payload)
 
     summary = {
         key: {
-            "auroc":         r["auroc"],
-            "ece":           r["ece"],
-            "ece_mean":      r["ece_mean"],
-            "hessian_trace": r["hessian_trace"],
+            "auroc":              r["auroc"],
+            "ece":                r["ece"],
+            "ece_mean":           r["ece_mean"],
+            "hessian_trace":      r["hessian_trace"],
+            "hessian_trace_ci95": r["hessian_trace_ci95"],
         }
         for key, r in results.items()
     }
@@ -1926,11 +1999,12 @@ def plot_ood_eval(payload: dict, cfg: Config, style: PlotStyle = DEFAULT_STYLE):
         (axes[0], "vit_large", "ViT-Large teacher (BLL)", style.teacher_color),
         (axes[1], "vit_small", "ViT-Small student (BLL+GW)", style.student_color),
     ]:
-        id_scores     = payload.get(f"{prefix}_id_scores")
-        ood_scores    = payload.get(f"{prefix}_ood_scores")
-        auroc         = payload.get(f"{prefix}_auroc")
-        ece           = payload.get(f"{prefix}_ece")
-        hessian_trace = payload.get(f"{prefix}_hessian_trace")
+        id_scores         = payload.get(f"{prefix}_id_scores")
+        ood_scores        = payload.get(f"{prefix}_ood_scores")
+        auroc             = payload.get(f"{prefix}_auroc")
+        ece               = payload.get(f"{prefix}_ece")
+        hessian_trace     = payload.get(f"{prefix}_hessian_trace")
+        hessian_trace_ci95 = payload.get(f"{prefix}_hessian_trace_ci95")
         if id_scores is None or ood_scores is None:
             ax.text(0.5, 0.5, "no data", ha="center", va="center", transform=ax.transAxes)
             continue
@@ -1940,7 +2014,12 @@ def plot_ood_eval(payload: dict, cfg: Config, style: PlotStyle = DEFAULT_STYLE):
                label="OOD: CIFAR-10 test")
         auroc_str = f"{float(auroc):.4f}" if auroc is not None else "n/a"
         ece_str   = f"{float(ece):.4f}" if ece is not None else "n/a"
-        htr_str   = f"{float(hessian_trace):.3g}" if hessian_trace is not None else "n/a"
+        if hessian_trace is None:
+            htr_str = "n/a"
+        elif hessian_trace_ci95 is not None:
+            htr_str = f"{float(hessian_trace):.3g} \u00b1 {float(hessian_trace_ci95):.2g}"
+        else:
+            htr_str = f"{float(hessian_trace):.3g}"
         ax.set_title(
             f"{label}\nAUROC = {auroc_str}   |   ECE = {ece_str}   |   Tr(H) \u2248 {htr_str}",
             fontsize=style.subtitle_fontsize)
@@ -2101,7 +2180,8 @@ def main():
             for key, m in ood_summary.items():
                 print(f"[Step 4b summary] {key}: "
                       f"AUROC={m['auroc']:.4f}  ECE={m['ece']:.4f}  "
-                      f"ECE_mean={m['ece_mean']:.4f}  Tr(H)~={m['hessian_trace']:.4f}")
+                      f"ECE_mean={m['ece_mean']:.4f}  "
+                      f"Tr(H)~={m['hessian_trace']:.4f} +/- {m['hessian_trace_ci95']:.4f} (95% CI)")
             plot_ood_eval(ood_payload, CFG)
 
         del teacher_model, student_model
