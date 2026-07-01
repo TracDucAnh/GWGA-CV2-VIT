@@ -1482,27 +1482,65 @@ def plot_loss_curves(history: dict, cfg: Config, style: PlotStyle = DEFAULT_STYL
 # =========================================================================
 
 def run_and_save_ood_eval(teacher_model, student_model, cfg: Config) -> dict:
-    """Tinh AUROC OOD (CIFAR-10) cho ca teacher va student, luu du lieu tho."""
-    id_loader  = build_cifar100_loaders(cfg, cfg.batch_size)[1]    # eval split
-    ood_loader = build_cifar10_ood_loader(cfg, cfg.batch_size)
+    """Tinh AUROC OOD (CIFAR-10), ECE (CIFAR-100 test, Naeini/Guo) va
+    Hessian-trace sharpness (Hutchinson estimator, tren build_landscape_loader)
+    cho ca teacher va student, luu du lieu tho.
+
+    Truoc day ham nay CHI tinh AUROC -- compute_ece() va
+    evaluate_hessian_trace_sharpness() da ton tai trong file nhung khong
+    duoc goi o Step 4B. Gio ca 3 metric deu duoc tinh cho model FINAL
+    (checkpoint da load)."""
+    id_loader        = build_cifar100_loaders(cfg, cfg.batch_size)[1]   # eval split
+    ood_loader       = build_cifar10_ood_loader(cfg, cfg.batch_size)
+    landscape_loader = build_landscape_loader(cfg)                      # cho Hessian-trace
 
     results = {}
     for key, model in [(TEACHER_KEY, teacher_model), (STUDENT_KEY, student_model)]:
         model.to(cfg.device)
+
+        # ---- AUROC (OOD detection: ID=CIFAR-100 vs OOD=CIFAR-10) ----
         print(f"\n[OOD] Evaluating {key} on ID=CIFAR-100 test vs OOD=CIFAR-10 test ...")
         r = evaluate_ood_auroc(model, id_loader, ood_loader, cfg)
-        results[key] = r
         print(f"[OOD] {key}: AUROC = {r['auroc']:.4f}")
+
+        # ---- ECE (calibration, ID=CIFAR-100 test) ----
+        print(f"[ECE] Evaluating {key} calibration on ID=CIFAR-100 test ...")
+        cls_metrics = evaluate_classification_metrics(
+            model, id_loader, cfg.device, cfg.mixed_precision_dtype,
+            ece_num_bins=cfg.ece_num_bins)
+        r["ece"] = cls_metrics["ece"]
+        print(f"[ECE] {key}: ECE = {r['ece']:.4f}")
+
+        # ---- Hessian-trace sharpness (Hutchinson, double-backprop) ----
+        print(f"[Hessian] Estimating {key} Hessian-trace sharpness "
+              f"({cfg.hessian_num_hutchinson_samples} Hutchinson samples x "
+              f"{cfg.hessian_eval_batches} batches) ...")
+        r["hessian_trace"] = evaluate_hessian_trace_sharpness(
+            model, landscape_loader, cfg, seed=cfg.hessian_seed)
+        print(f"[Hessian] {key}: Tr(H) ~= {r['hessian_trace']:.4f}")
+
+        results[key] = r
 
     payload = {}
     for key, r in results.items():
         safe_key = key.split(" ")[0].replace("-", "_").lower()
-        payload[f"{safe_key}_id_scores"]  = np.array(r["id_scores"])
-        payload[f"{safe_key}_ood_scores"] = np.array(r["ood_scores"])
-        payload[f"{safe_key}_auroc"]      = r["auroc"]
-        payload[f"{safe_key}_model_key"]  = key
+        payload[f"{safe_key}_id_scores"]     = np.array(r["id_scores"])
+        payload[f"{safe_key}_ood_scores"]    = np.array(r["ood_scores"])
+        payload[f"{safe_key}_auroc"]         = r["auroc"]
+        payload[f"{safe_key}_ece"]           = r["ece"]
+        payload[f"{safe_key}_hessian_trace"] = r["hessian_trace"]
+        payload[f"{safe_key}_model_key"]     = key
     save_figure_data(cfg, "ood_eval", payload)
-    return {key: {"auroc": r["auroc"]} for key, r in results.items()}, payload
+
+    summary = {
+        key: {
+            "auroc":         r["auroc"],
+            "ece":           r["ece"],
+            "hessian_trace": r["hessian_trace"],
+        }
+        for key, r in results.items()
+    }
+    return summary, payload
 
 
 def plot_ood_eval(payload: dict, cfg: Config, style: PlotStyle = DEFAULT_STYLE):
@@ -1513,9 +1551,11 @@ def plot_ood_eval(payload: dict, cfg: Config, style: PlotStyle = DEFAULT_STYLE):
         (axes[0], "vit_large", "ViT-Large teacher", style.teacher_color),
         (axes[1], "vit_small", "ViT-Small student (KD)", style.student_color),
     ]:
-        id_scores  = payload.get(f"{prefix}_id_scores")
-        ood_scores = payload.get(f"{prefix}_ood_scores")
-        auroc      = payload.get(f"{prefix}_auroc")
+        id_scores     = payload.get(f"{prefix}_id_scores")
+        ood_scores    = payload.get(f"{prefix}_ood_scores")
+        auroc         = payload.get(f"{prefix}_auroc")
+        ece           = payload.get(f"{prefix}_ece")
+        hessian_trace = payload.get(f"{prefix}_hessian_trace")
         if id_scores is None or ood_scores is None:
             ax.text(0.5, 0.5, "no data", ha="center", va="center", transform=ax.transAxes)
             continue
@@ -1523,8 +1563,12 @@ def plot_ood_eval(payload: dict, cfg: Config, style: PlotStyle = DEFAULT_STYLE):
                label="ID: CIFAR-100 test")
         ax.hist(ood_scores, bins=30, alpha=0.6, density=True, color="tab:red",
                label="OOD: CIFAR-10 test")
-        auroc_str = f"{auroc:.4f}" if auroc is not None else "n/a"
-        ax.set_title(f"{label}\nAUROC = {auroc_str}", fontsize=style.subtitle_fontsize)
+        auroc_str = f"{float(auroc):.4f}" if auroc is not None else "n/a"
+        ece_str   = f"{float(ece):.4f}" if ece is not None else "n/a"
+        htr_str   = f"{float(hessian_trace):.3g}" if hessian_trace is not None else "n/a"
+        ax.set_title(
+            f"{label}\nAUROC = {auroc_str}   |   ECE = {ece_str}   |   Tr(H) \u2248 {htr_str}",
+            fontsize=style.subtitle_fontsize)
         ax.set_xlabel("Predictive entropy (softmax)", fontsize=style.label_fontsize)
         ax.set_ylabel("Density", fontsize=style.label_fontsize)
         ax.tick_params(labelsize=style.tick_fontsize)
@@ -1646,8 +1690,13 @@ def main():
         )
 
         if CFG.run_ood_eval:
-            print("\n>>> STEP 4b: OOD evaluation (ID=CIFAR-100, OOD=CIFAR-10) <<<")
-            _, ood_payload = run_and_save_ood_eval(teacher_model, student_model, CFG)
+            print("\n>>> STEP 4b: OOD AUROC (ID=CIFAR-100, OOD=CIFAR-10) "
+                  "+ ECE + Hessian-trace sharpness (final checkpoints) <<<")
+            ood_summary, ood_payload = run_and_save_ood_eval(teacher_model, student_model, CFG)
+            for key, m in ood_summary.items():
+                print(f"[Step 4b summary] {key}: "
+                      f"AUROC={m['auroc']:.4f}  ECE={m['ece']:.4f}  "
+                      f"Tr(H)~={m['hessian_trace']:.4f}")
             plot_ood_eval(ood_payload, CFG)
 
         del teacher_model, student_model
