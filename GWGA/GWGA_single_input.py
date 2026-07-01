@@ -155,7 +155,7 @@ class Config:
     teacher_backbone_lr_mult: float = 0.1   # backbone lr = learning_rate * mult
 
     # ── Student distillation ─────────────────────────────────────────────
-    student_num_epochs: int = 30
+    student_num_epochs: int = 15
     phase1_frac: float = 0.3
     phase2_frac: float = 0.3
     phase3_frac: float = 0.4
