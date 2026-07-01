@@ -92,6 +92,14 @@ from PIL import Image
 
 warnings.filterwarnings("ignore")
 
+try:
+    from torch.nn.attention import sdpa_kernel, SDPBackend
+    _SDPA_MATH_CTX = lambda: sdpa_kernel(SDPBackend.MATH)
+except ImportError:
+    # PyTorch cu hon (truoc 2.3) dung API deprecated
+    _SDPA_MATH_CTX = lambda: torch.backends.cuda.sdp_kernel(
+        enable_flash=False, enable_math=True, enable_mem_efficient=False
+    )
 
 # =========================================================================
 # DATASET PATHS (du lieu DA TAI VE SAN, nam trong thu muc `dataset/` o
@@ -147,7 +155,7 @@ class Config:
     teacher_backbone_lr_mult: float = 0.1   # backbone lr = learning_rate * mult
 
     # ── Student distillation ─────────────────────────────────────────────
-    student_num_epochs: int = 10
+    student_num_epochs: int = 30
     phase1_frac: float = 0.3
     phase2_frac: float = 0.3
     phase3_frac: float = 0.4
@@ -996,35 +1004,32 @@ def evaluate_ood_auroc(model: BLLViTClassifier, id_loader, ood_loader, cfg: Conf
 # loss tai theta* HIEN TAI (KHONG perturb).
 # =========================================================================
 
-def compute_hessian_trace(model: BLLViTClassifier, params: List[torch.Tensor],
+def compute_hessian_trace(model: ViTClassifier, params: List[torch.Tensor],
                           images: torch.Tensor, labels: torch.Tensor,
                           num_hutchinson_samples: int, seed: Optional[int] = None) -> float:
-    """
-    Tr(H) ~= (1/M) * sum_i z_i^T H z_i, voi z_i ~ Rademacher i.i.d.
-    (Hutchinson, 1990). Grad bac 1 (create_graph=True) chi tinh 1 LAN cho
-    ca M mau; moi z_i chi can 1 lan backward bac 2 them. Generator rieng
-    (khong dung torch.manual_seed toan cuc) de khong lam xao tron RNG
-    stream chinh cua training loop.
-    """
-    logits = model.forward_mean(images)
-    loss = F.cross_entropy(logits.float(), labels)
-    first_grads = torch.autograd.grad(loss, params, create_graph=True)
+    # SDPA backend "efficient"/"flash" (mac dinh cua timm ViT) KHONG ho tro
+    # double backward -- can ep dung backend "math" (thuan matrix multiply)
+    # trong suot qua trinh tinh ca forward LAN 2 lan backward (bac 1 + bac 2).
+    with _SDPA_MATH_CTX():
+        logits = model(images)
+        loss = F.cross_entropy(logits.float(), labels)
+        first_grads = torch.autograd.grad(loss, params, create_graph=True)
 
-    gen = torch.Generator()
-    if seed is not None:
-        gen.manual_seed(seed)
+        gen = torch.Generator()
+        if seed is not None:
+            gen.manual_seed(seed)
 
-    trace_samples = []
-    for i in range(num_hutchinson_samples):
-        vecs = [
-            (torch.randint(0, 2, p.shape, generator=gen).float() * 2.0 - 1.0).to(p.device, dtype=p.dtype)
-            for p in params
-        ]
-        dot = sum((g * v).sum() for g, v in zip(first_grads, vecs))
-        retain = i < num_hutchinson_samples - 1
-        hv = torch.autograd.grad(dot, params, retain_graph=retain)
-        trace_est = sum((h * v).sum().item() for h, v in zip(hv, vecs))
-        trace_samples.append(trace_est)
+        trace_samples = []
+        for i in range(num_hutchinson_samples):
+            vecs = [
+                (torch.randint(0, 2, p.shape, generator=gen).float() * 2.0 - 1.0).to(p.device, dtype=p.dtype)
+                for p in params
+            ]
+            dot = sum((g * v).sum() for g, v in zip(first_grads, vecs))
+            retain = i < num_hutchinson_samples - 1
+            hv = torch.autograd.grad(dot, params, retain_graph=retain)
+            trace_est = sum((h * v).sum().item() for h, v in zip(hv, vecs))
+            trace_samples.append(trace_est)
     return float(np.mean(trace_samples))
 
 
