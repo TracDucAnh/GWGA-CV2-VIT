@@ -161,7 +161,7 @@ class Config:
 
     # ── Student distillation ─────────────────────────────────────────────
     student_num_epochs: int = 10
-    phase1_frac: float = 0.3      # ti le epoch DAU chi train CE (khong KD)
+    phase1_frac: float = 0     # ti le epoch DAU chi train CE (khong KD)
     kd_alpha_max: float = 1.0     # trong so toi da cua soft-target KD loss (sau phase1)
 
     # ── Optimization ──────────────────────────────────────────────────────
@@ -1283,26 +1283,41 @@ def save_landscape_data(cfg: Config, data: dict):
         })
 
 
-def _clip_for_display(lg: np.ndarray, low_pct: float = 1.0, high_pct: float = 90.0) -> np.ndarray:
-    """Clip 2 phia theo percentile (mac dinh [1, 90]) de khong "nuot" chi
-    tiet vung tam khi vai diem ngoai bien co bien do lon hon nhieu bac."""
-    lo = np.percentile(lg, low_pct)
-    hi = np.percentile(lg, high_pct)
+def _compute_shared_clip_bounds(loss_grids: List[np.ndarray], low_pct: float = 1.0,
+                                high_pct: float = 90.0) -> Tuple[float, float]:
+    """Tinh (lo, hi) CHUNG cho TOAN BO cac loss_grid duoc truyen vao (vd: ca
+    teacher va student trong CUNG 1 figure), bang cach GOP het gia tri thanh
+    1 mang roi moi lay percentile -- day la ham DUY NHAT dung de tinh
+    khoang mau hien thi (thay cho ham clip-rieng-tung-panel truoc day, da
+    bi bo vi gay lech thang do nhiet giua cac panel).
+
+    Day la ham then chot de dam bao "cung thang do nhiet" (shared color
+    scale): mau xanh/do o panel teacher va panel student PHAI ung voi
+    CUNG mot gia tri loss, neu khong viec so sanh do sharp/flat bang mau
+    giua 2 model se sai lech."""
+    pooled = np.concatenate([np.asarray(g).reshape(-1) for g in loss_grids])
+    lo = float(np.percentile(pooled, low_pct))
+    hi = float(np.percentile(pooled, high_pct))
     if hi <= lo:
-        hi = lg.max()
-    return np.clip(lg, lo, hi)
+        hi = float(pooled.max())
+    if hi <= lo:
+        hi = lo + 1.0
+    return lo, hi
 
 
-def _draw_3d_axis(ax, A, B, lg, key, fig, style: PlotStyle):
-    """Mau va truc Z deu theo thang LINEAR (gia tri loss da clip)."""
-    vmin = float(lg.min())
-    vmax = float(lg.max())
+def _draw_3d_axis(ax, A, B, lg, key, fig, style: PlotStyle, vmin: float, vmax: float):
+    """Mau va truc Z deu theo thang LINEAR (gia tri loss da clip). vmin/vmax
+    duoc TRUYEN VAO TU NGOAI (tinh CHUNG cho ca figure, xem
+    _compute_shared_clip_bounds()) de dam bao CUNG thang do nhiet giua
+    cac panel (teacher vs student, 3D vs 2D) -- KHONG tu tinh rieng tren
+    lg cua panel nay nua."""
     if vmax <= vmin:
         vmax = vmin + 1.0
     norm = plt.Normalize(vmin=vmin, vmax=vmax)
     facecolors = plt.get_cmap(style.cmap_name)(norm(lg))
     surf = ax.plot_surface(A, B, lg, facecolors=facecolors, linewidth=0,
                            antialiased=True, edgecolor="none", shade=False)
+    ax.set_zlim(vmin, vmax)   # truc Z cung dung chung khoang [vmin, vmax]
     ax.set_title(f"{key} -- 3D (linear scale)", fontsize=style.subtitle_fontsize)
     ax.set_xlabel("alpha", fontsize=style.label_fontsize)
     ax.set_ylabel("beta", fontsize=style.label_fontsize)
@@ -1312,10 +1327,10 @@ def _draw_3d_axis(ax, A, B, lg, key, fig, style: PlotStyle):
     fig.colorbar(mappable, ax=ax, shrink=0.6, pad=0.1, label="loss")
 
 
-def _draw_2d_axis(ax, A, B, lg, key, fig, style: PlotStyle):
-    """Contour 2D voi thang mau LINEAR de phan giai vung day phang quanh theta*."""
-    vmin = float(lg.min())
-    vmax = float(lg.max())
+def _draw_2d_axis(ax, A, B, lg, key, fig, style: PlotStyle, vmin: float, vmax: float):
+    """Contour 2D voi thang mau LINEAR de phan giai vung day phang quanh
+    theta*. vmin/vmax duoc TRUYEN VAO TU NGOAI (giong _draw_3d_axis) --
+    cung mot cap [vmin, vmax] duoc dung cho MOI panel trong figure."""
     if vmax <= vmin:
         vmax = vmin + 1.0
     norm = plt.Normalize(vmin=vmin, vmax=vmax)
@@ -1332,10 +1347,26 @@ def _draw_2d_axis(ax, A, B, lg, key, fig, style: PlotStyle):
 
 def plot_landscapes_all(data: dict, cfg: Config, title: str, save_name_prefix: str,
                         style: PlotStyle = DEFAULT_STYLE):
-    """Ve tu du lieu landscape da tinh san (data tu compute_landscape_data hoac load_figure_data)."""
+    """Ve tu du lieu landscape da tinh san (data tu compute_landscape_data hoac load_figure_data).
+
+    CUNG THANG DO NHIET (shared color scale): (vmin, vmax) duoc tinh MOT
+    LAN DUY NHAT tren TOAN BO loss_grid cua moi key (teacher + student),
+    dung _compute_shared_clip_bounds() -- roi dung CHUNG cap gia tri nay
+    cho MOI panel (teacher, student, ca hang 3D va hang 2D) trong CA 3
+    file anh xuat ra (_3d_1x2, _2d_1x2, _2x2). Neu tinh rieng tung panel
+    (nhu ban cu) thi mau xanh/do o 2 panel se ung voi 2 gia tri loss khac
+    nhau -- KHONG so sanh duoc do sharp/flat giua 2 model bang mau."""
     results = data["results"]
     keys = list(results.keys())
     n    = len(keys)
+
+    # ── Tinh (vmin, vmax) CHUNG 1 LAN cho toan bo figure (khong tinh lai
+    # trong tung vong lap suffix/panel) ──────────────────────────────────
+    raw_grids = [results[key]["loss_grid"] for key in keys]
+    vmin, vmax = _compute_shared_clip_bounds(raw_grids)
+    print(f"[landscape] shared color scale (vmin, vmax) = ({vmin:.4f}, {vmax:.4f}) "
+          f"tinh chung tren {len(keys)} model: {keys}")
+
     for suffix, rows_spec in [("_3d_1x2.png", [["3d"]]), ("_2d_1x2.png", [["2d"]]),
                               ("_2x2.png", [["3d"], ["2d"]])]:
         fig = plt.figure(figsize=(style.figsize_single[0]*n, style.figsize_single[1]*len(rows_spec)))
@@ -1345,15 +1376,16 @@ def plot_landscapes_all(data: dict, cfg: Config, title: str, save_name_prefix: s
                 rdata = results[key]
                 alphas, betas, lg = rdata["alphas"], rdata["betas"], rdata["loss_grid"]
                 A, B = np.meshgrid(alphas, betas, indexing="ij")
-                lgc  = _clip_for_display(lg)
+                lgc  = np.clip(lg, vmin, vmax)   # clip theo cap [vmin,vmax] CHUNG (khong rieng tung panel)
                 idx  = r * n + c + 1
                 if mode == "3d":
                     ax = fig.add_subplot(len(rows_spec), n, idx, projection="3d")
-                    _draw_3d_axis(ax, A, B, lgc, key, fig, style)
+                    _draw_3d_axis(ax, A, B, lgc, key, fig, style, vmin, vmax)
                 else:
                     ax = fig.add_subplot(len(rows_spec), n, idx)
-                    _draw_2d_axis(ax, A, B, lgc, key, fig, style)
-        fig.suptitle(title, fontsize=style.title_fontsize, fontweight="bold")
+                    _draw_2d_axis(ax, A, B, lgc, key, fig, style, vmin, vmax)
+        fig.suptitle(title + f"  (shared color scale: [{vmin:.3f}, {vmax:.3f}])",
+                    fontsize=style.title_fontsize, fontweight="bold")
         fig.tight_layout(rect=[0, 0, 1, 0.95])
         p = os.path.join(cfg.figure_dir, save_name_prefix + suffix)
         os.makedirs(os.path.dirname(p), exist_ok=True)
