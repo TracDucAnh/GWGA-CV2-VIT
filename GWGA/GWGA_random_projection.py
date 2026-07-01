@@ -165,7 +165,7 @@ class Config:
     teacher_name: str = "vit_large_patch16_224"
     student_name: str = "vit_small_patch16_224"
     teacher_pretrained: bool = True     # teacher: load checkpoint pretrained (ImageNet)
-    student_pretrained: bool = True    # student: distill tu dau (random init)
+    student_pretrained: bool = False    # student: distill tu dau (random init)
     img_size: int = 224                 # upsize CIFAR (32x32) len 224x224 -- input chuan cua patch16/224
 
     # ── Data ──────────────────────────────────────────────────────────────
