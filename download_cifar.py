@@ -74,7 +74,8 @@ def md5_of_file(path: Path, chunk_size: int = 1 << 20) -> str:
 
 
 def _make_session() -> requests.Session:
-    """Session co retry/backoff de chiu duoc duong truyen cham/chap chon."""
+    """Session co retry/backoff de chiu duoc duong truyen cham/chap chon.
+    Dung cho phan TAI THAT (GET), KHONG dung cho HEAD-probe (xem _probe_head)."""
     session = requests.Session()
     retries = Retry(
         total=5, connect=5, read=5, backoff_factor=1.5,
@@ -84,6 +85,34 @@ def _make_session() -> requests.Session:
     session.mount("https://", adapter)
     session.mount("http://", adapter)
     return session
+
+
+def _probe_head(url: str, timeout: tuple[int, int] = (5, 10)) -> tuple[int, bool]:
+    """Kiem tra content-length / Accept-Ranges TRUOC khi tai, bang session
+    RIENG khong retry (max_retries=0) va timeout NGAN.
+
+    Ly do tach rieng: neu dung chung session chinh (Retry total=5,
+    backoff_factor=1.5, timeout=(15,30)) thi 1 lan HEAD "cham" hoac bi
+    redirect toi dich cham co the ngon toi vai PHUT (moi lan thu toi da
+    15s connect + 30s read, nhan 5-6 lan thu, cong them backoff) truoc khi
+    moi fallback duoc -- day chinh la nguyen nhan script "dung im" rat lau
+    ma nguoi dung phai Ctrl+C. Probe nay fail nhanh trong ~10-15s la cung,
+    roi fallback ngay ve tai tuan tu (an toan, cham hon nhung khong treo)."""
+    probe_session = requests.Session()
+    probe_session.mount("https://", HTTPAdapter(max_retries=0))
+    probe_session.mount("http://", HTTPAdapter(max_retries=0))
+    try:
+        head = probe_session.head(url, allow_redirects=True, timeout=timeout)
+        total = int(head.headers.get("content-length", 0))
+        supports_range = head.headers.get("accept-ranges", "").lower() == "bytes"
+        return total, supports_range
+    except requests.RequestException as e:
+        print(f"[warn] HEAD probe that bai/qua cham ({type(e).__name__}: {e}) "
+              f"-> fallback ve tai tuan tu 1 luong (KHONG cho lau hon "
+              f"{timeout[0] + timeout[1]}s).")
+        return 0, False
+    finally:
+        probe_session.close()
 
 
 def _download_segment(session: requests.Session, url: str, dest_path: Path,
@@ -132,13 +161,7 @@ def download_file(url: str, dest_path: Path, expected_md5: str,
     dest_path.parent.mkdir(parents=True, exist_ok=True)
     session = _make_session()
 
-    total, supports_range = 0, False
-    try:
-        head = session.head(url, allow_redirects=True, timeout=(15, 30))
-        total = int(head.headers.get("content-length", 0))
-        supports_range = head.headers.get("accept-ranges", "").lower() == "bytes"
-    except requests.RequestException:
-        pass  # se fallback ve tai tuan tu ben duoi
+    total, supports_range = _probe_head(url)
 
     if num_connections <= 1 or not supports_range or total == 0:
         _download_sequential(session, url, dest_path, chunk_size)
