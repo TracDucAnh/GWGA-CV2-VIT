@@ -1203,7 +1203,6 @@ def fit_teacher(cfg: Config) -> Tuple[str, List[Dict]]:
                     kl_term = kl_scale * kl_beta * kl_raw
                     loss = (ce + kl_term) / cfg.gradient_accumulation_steps
 
-                loss = loss / cfg.gradient_accumulation_steps
                 loss.backward()
 
                 if (step + 1) % cfg.gradient_accumulation_steps == 0:
@@ -2009,8 +2008,8 @@ def main():
     print(f"Device: {CFG.device}")
     if CFG.device == "cuda":
         print(f"GPU: {torch.cuda.get_device_name(0)}")
-    print(f"Teacher epochs == Student epochs (yeu cau): "
-          f"{CFG.teacher_num_epochs} == {CFG.student_num_epochs}")
+    print(f"Teacher stage split: deterministic backbone {CFG.teacher_backbone_epochs} epochs + BLL/ELBO {CFG.teacher_bll_epochs} epochs")
+    print(f"Student stage split: deterministic backbone {CFG.student_backbone_epochs} epochs + BLL/ELBO {CFG.student_bll_epochs} epochs + GW {CFG.student_gw_epochs} epochs")
 
     # ============================================================
     # TẠO GLOBAL SHARED DIRECTIONS ĐỂ ĐẢM BẢO BEFORE/AFTER CÙNG DIRECTION
@@ -2059,7 +2058,7 @@ def main():
 
         if CFG.run_teacher_fit:
             print(f"\n>>> STEP 2: Fitting teacher BLL on pretrained ViT-Large "
-                  f"({CFG.teacher_num_epochs} epochs, = student_num_epochs) <<<")
+                  f"({CFG.teacher_backbone_epochs + CFG.teacher_bll_epochs} epochs total) <<<")
             teacher_ckpt_path, teacher_history = fit_teacher(CFG)
 
     student_ckpt_path = os.path.join(CFG.checkpoint_dir, "student_vit_small_bll_gw")
@@ -2067,7 +2066,7 @@ def main():
 
     if CFG.run_distillation:
         print(f"\n>>> STEP 3: Distilling student (BLL+GW single-input, "
-              f"{CFG.student_num_epochs} epochs) <<<")
+              f"{CFG.student_backbone_epochs + CFG.student_bll_epochs + CFG.student_gw_epochs} epochs total) <<<")
         print(f"[distill] Loading teacher checkpoint for UMAP: {teacher_ckpt_path}")
         teacher_for_umap = load_bll_checkpoint(teacher_ckpt_path, CFG.teacher_name)
         teacher_for_umap.eval()
