@@ -2129,6 +2129,10 @@ def main():
             CFG, teacher_ckpt_path=teacher_ckpt_path, teacher_model_for_umap=teacher_for_umap,
         )
 
+        del teacher_for_umap
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
     if teacher_history or student_history:
         save_history_data(CFG, teacher_history, student_history)
 
