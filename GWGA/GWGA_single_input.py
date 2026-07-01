@@ -146,16 +146,24 @@ class Config:
     num_workers: int = 4
 
     # ── Teacher fit (tren pretrained backbone) ───────────────────────────
-    # YEU CAU: so epoch fit teacher = so epoch distill student -> gan o
-    # ngay sau khi tao CFG (xem duoi class Config).
-    teacher_num_epochs: int = 10
+    # Stage 1: deterministic backbone training (CE, backbone + deterministic
+    # mean head). Stage 2: freeze backbone and train BLL via ELBO + MFVI.
+    teacher_num_epochs: int = 15
+    teacher_backbone_epochs: int = 10
+    teacher_bll_epochs: int = 5
     teacher_kl_beta_max: float = 0.1
     teacher_kl_warmup_frac: float = 0.5
     teacher_finetune_backbone: bool = True
-    teacher_backbone_lr_mult: float = 0.1   # backbone lr = learning_rate * mult
+    teacher_backbone_lr_mult: float = 1   # backbone lr = learning_rate * mult
 
     # ── Student distillation ─────────────────────────────────────────────
-    student_num_epochs: int = 15
+    # Stage 1: deterministic backbone training (CE, backbone + deterministic
+    # mean head). Stage 2: freeze backbone and train BLL via ELBO + MFVI.
+    # Stage 3: freeze backbone and continue BLL + GW distillation.
+    student_num_epochs: int = 10
+    student_backbone_epochs: int = 10
+    student_bll_epochs: int = 5
+    student_gw_epochs: int = 5
     phase1_frac: float = 0.3
     phase2_frac: float = 0.3
     phase3_frac: float = 0.4
@@ -330,6 +338,18 @@ def get_sigma_stats(model) -> dict:
             "sigma_min":  sigma.min().item(),
             "sigma_max":  sigma.max().item(),
         }
+
+
+def set_backbone_trainable(model, trainable: bool):
+    for p in model.backbone.parameters():
+        p.requires_grad_(trainable)
+
+
+def set_bll_head_trainable(model, train_mu: bool, train_sigma: bool):
+    for p in model.head.parameters():
+        p.requires_grad_(False)
+    model.head.mu.requires_grad_(train_mu)
+    model.head.log_sigma.requires_grad_(train_sigma)
 
 
 # =========================================================================
@@ -1081,23 +1101,13 @@ def evaluate_hessian_trace_sharpness(model: BLLViTClassifier, loader, cfg: Confi
 
 def fit_teacher(cfg: Config) -> Tuple[str, List[Dict]]:
     """
-    Teacher = ViT-Large PRETRAINED (timm, ImageNet weights) + BLL head moi
-    khoi tao. Backbone pretrained co the duoc finetune nhe (lr nho hon,
-    cfg.teacher_backbone_lr_mult) hoac freeze hoan toan
-    (teacher_finetune_backbone=False), trong khi BLL head luon hoc tu dau
-    qua ELBO. So epoch fit teacher = so epoch distill student (CFG.teacher_num_epochs
-    da duoc gan = CFG.student_num_epochs ngay sau khi tao CFG).
-
-    LUU Y (fix bug UMAP bi de): tag UMAP cua giai doan nay la "teacher_fit"
-    (KHONG phai "teacher" trung voi giai doan distill) -- global_step o day
-    la mot counter rieng, doc lap voi global_step trong distill_student().
-    Neu dung chung tag "teacher", file
-    figures/umap/teacher_step_000100.png va figure_data/umap_teacher_step_000100.*
-    se bi GHI DE boi UMAP cua teacher (frozen) trong giai doan distill khi
-    hai counter cung cham step 100, 200, ... -- lam mat vinh vien UMAP cua
-    teacher luc dang fit.
+    Teacher training is split into two explicit stages:
+      1) deterministic backbone stage: train backbone + deterministic mean head
+         using CE loss.
+      2) BLL/ELBO stage: freeze backbone and train Bayesian last layer with
+         ELBO + MFVI.
     """
-    print(f"\n{'='*80}\nSTAGE 1: FITTING TEACHER BLL (pretrained backbone) -- {cfg.teacher_name}\n{'='*80}")
+    print(f"\n{'='*80}\nSTAGE 1-2: FITTING TEACHER BLL (split backbone -> BLL) -- {cfg.teacher_name}\n{'='*80}")
 
     model = BLLViTClassifier.from_timm_name(
         cfg.teacher_name, cfg.num_labels, cfg.teacher_pretrained,
@@ -1107,131 +1117,168 @@ def fit_teacher(cfg: Config) -> Tuple[str, List[Dict]]:
     if cfg.use_gradient_checkpointing:
         model.enable_gradient_checkpointing()
 
-    if not cfg.teacher_finetune_backbone:
-        for p in model.backbone.parameters():
-            p.requires_grad_(False)
-
     print(f"[UMAP] Building teacher probe batch ({cfg.umap_probe_samples} samples)...")
     umap_probe = build_umap_probe_batch(cfg, dataset_name="cifar100")
 
     train_loader, eval_loader = build_cifar100_loaders(cfg, cfg.batch_size)
     n_train = len(train_loader.dataset)
 
-    if cfg.teacher_finetune_backbone:
-        param_groups = [
-            {"params": model.backbone.parameters(), "lr": cfg.learning_rate * cfg.teacher_backbone_lr_mult},
-            {"params": model.head.parameters(),     "lr": cfg.learning_rate},
-        ]
-    else:
-        param_groups = [{"params": model.head.parameters(), "lr": cfg.learning_rate}]
-    optimizer = torch.optim.AdamW(param_groups, weight_decay=cfg.weight_decay)
-
-    total_steps  = (len(train_loader) // cfg.gradient_accumulation_steps) * cfg.teacher_num_epochs
-    warmup_steps = int(total_steps * cfg.warmup_ratio)
-    scheduler    = torch.optim.lr_scheduler.LambdaLR(
-        optimizer,
-        lambda step: min(1.0, step / max(1, warmup_steps)) *
-                     max(0.0, (total_steps - step) / max(1, total_steps - warmup_steps)),
-    )
-    kl_warmup_steps = max(1, int(total_steps * cfg.teacher_kl_warmup_frac))
-
     s0 = get_sigma_stats(model)
     print(f"[sigma init] mean={s0['sigma_mean']:.5f}  min={s0['sigma_min']:.5f}  max={s0['sigma_max']:.5f}")
 
     history: List[Dict] = []
     model.train()
-    global_step      = 0
+    global_step = 0
     latest_ckpt_path = os.path.join(cfg.checkpoint_dir, "teacher_vit_large_bll_latest")
 
-    epoch_pbar = tqdm(range(1, cfg.teacher_num_epochs + 1), desc="teacher epochs", unit="epoch")
-    for epoch in epoch_pbar:
-        epoch_ce, epoch_kl, epoch_kl_term, epoch_total, n_steps = 0.0, 0.0, 0.0, 0.0, 0
-        t0 = time.time()
-        optimizer.zero_grad(set_to_none=True)
+    stage_specs = [
+        ("deterministic_backbone", cfg.teacher_backbone_epochs, "backbone"),
+        ("bll_elbo", cfg.teacher_bll_epochs, "bll"),
+    ]
 
-        step_pbar = tqdm(enumerate(train_loader), total=len(train_loader),
-                         desc=f"teacher epoch {epoch}/{cfg.teacher_num_epochs}",
-                         unit="step", leave=False)
-        for step, (images, labels) in step_pbar:
-            images = images.to(cfg.device, non_blocking=True)
-            labels = labels.to(cfg.device, non_blocking=True)
+    for stage_name, num_epochs, stage_kind in stage_specs:
+        if num_epochs <= 0:
+            continue
 
-            with torch.autocast(device_type="cuda" if cfg.device == "cuda" else "cpu",
-                                dtype=cfg.mixed_precision_dtype):
-                logits = model(images, cfg.num_particles)
-            logits = logits.float()
-            B, K, C = logits.shape
-            ce      = F.cross_entropy(logits.reshape(B*K, C),
-                                      labels.unsqueeze(1).expand(-1, K).reshape(-1))
-            kl_raw  = model.kl_divergence()
-            kl_beta = cfg.teacher_kl_beta_max * min(1.0, global_step / kl_warmup_steps)
-            kl_scale = cfg.batch_size / max(1, n_train)
-            kl_term   = kl_scale * kl_beta * kl_raw
-            total_raw = ce + kl_term
-            loss = total_raw / cfg.gradient_accumulation_steps
-            loss.backward()
+        if stage_kind == "backbone":
+            set_backbone_trainable(model, True)
+            set_bll_head_trainable(model, train_mu=True, train_sigma=False)
+            if cfg.teacher_finetune_backbone:
+                param_groups = [
+                    {"params": model.backbone.parameters(), "lr": cfg.learning_rate * cfg.teacher_backbone_lr_mult},
+                    {"params": [model.head.mu], "lr": cfg.learning_rate},
+                ]
+            else:
+                set_backbone_trainable(model, False)
+                param_groups = [{"params": [model.head.mu], "lr": cfg.learning_rate}]
+        else:
+            set_backbone_trainable(model, False)
+            set_bll_head_trainable(model, train_mu=True, train_sigma=True)
+            param_groups = [{"params": model.head.parameters(), "lr": cfg.learning_rate}]
 
-            if (step + 1) % cfg.gradient_accumulation_steps == 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.max_grad_norm)
-                optimizer.step()
-                scheduler.step()
-                optimizer.zero_grad(set_to_none=True)
-                global_step += 1
+        optimizer = torch.optim.AdamW(param_groups, weight_decay=cfg.weight_decay)
+        total_steps = (len(train_loader) // cfg.gradient_accumulation_steps) * num_epochs
+        warmup_steps = int(total_steps * cfg.warmup_ratio)
+        scheduler = torch.optim.lr_scheduler.LambdaLR(
+            optimizer,
+            lambda step: min(1.0, step / max(1, warmup_steps)) *
+                         max(0.0, (total_steps - step) / max(1, total_steps - warmup_steps)),
+        )
+        kl_warmup_steps = max(1, int(total_steps * cfg.teacher_kl_warmup_frac)) if stage_kind == "bll" else 1
 
-                if global_step % cfg.umap_every_n_steps == 0:
-                    # FIX: tag "teacher_fit" (truoc la "teacher") de KHONG
-                    # trung voi tag cua teacher ben giai doan distill_student().
-                    run_and_plot_umap(model, umap_probe, "teacher_fit", global_step, epoch, "fit", cfg)
-                    model.train()
+        print(f"[teacher stage] name={stage_name}  epochs={num_epochs}  backbone_trainable={stage_kind == 'backbone'}")
+        epoch_pbar = tqdm(range(1, num_epochs + 1), desc=f"teacher {stage_name}", unit="epoch")
+        for epoch in epoch_pbar:
+            epoch_ce, epoch_kl, epoch_kl_term, epoch_total, n_steps = 0.0, 0.0, 0.0, 0.0, 0
+            t0 = time.time()
+            optimizer.zero_grad(set_to_none=True)
 
-            epoch_ce      += ce.item()
-            epoch_kl      += kl_raw.item()
-            epoch_kl_term += kl_term.item()
-            epoch_total   += total_raw.item()
-            n_steps       += 1
+            step_pbar = tqdm(enumerate(train_loader), total=len(train_loader),
+                             desc=f"teacher {stage_name} epoch {epoch}/{num_epochs}",
+                             unit="step", leave=False)
+            for step, (images, labels) in step_pbar:
+                images = images.to(cfg.device, non_blocking=True)
+                labels = labels.to(cfg.device, non_blocking=True)
 
+                if stage_kind == "backbone":
+                    with torch.autocast(
+                        device_type="cuda" if cfg.device == "cuda" else "cpu",
+                        dtype=cfg.mixed_precision_dtype,
+                    ):
+                        logits = model.forward_mean(images)
+                    loss = F.cross_entropy(logits, labels)
+                else:
+                    with torch.autocast(
+                        device_type="cuda" if cfg.device == "cuda" else "cpu",
+                        dtype=cfg.mixed_precision_dtype,
+                    ):
+                        logits = model(images, cfg.num_particles)
+                    logits = logits.float()
+                    B, K, C = logits.shape
+                    ce = F.cross_entropy(logits.reshape(B * K, C),
+                                         labels.unsqueeze(1).expand(-1, K).reshape(-1))
+                    kl_raw = model.kl_divergence()
+                    kl_beta = cfg.teacher_kl_beta_max * min(1.0, global_step / kl_warmup_steps)
+                    kl_scale = cfg.batch_size / max(1, n_train)
+                    kl_term = kl_scale * kl_beta * kl_raw
+                    loss = (ce + kl_term) / cfg.gradient_accumulation_steps
+
+                loss = loss / cfg.gradient_accumulation_steps
+                loss.backward()
+
+                if (step + 1) % cfg.gradient_accumulation_steps == 0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.max_grad_norm)
+                    optimizer.step()
+                    scheduler.step()
+                    optimizer.zero_grad(set_to_none=True)
+                    global_step += 1
+
+                    if global_step % cfg.umap_every_n_steps == 0:
+                        run_and_plot_umap(
+                            model, umap_probe, f"teacher_{stage_name}",
+                            global_step, epoch, stage_name, cfg,
+                        )
+                        model.train()
+
+                if stage_kind == "backbone":
+                    epoch_ce += loss.item() * cfg.gradient_accumulation_steps
+                    epoch_kl += 0.0
+                    epoch_kl_term += 0.0
+                    epoch_total += loss.item() * cfg.gradient_accumulation_steps
+                else:
+                    epoch_ce += ce.item()
+                    epoch_kl += kl_raw.item()
+                    epoch_kl_term += kl_term.item()
+                    epoch_total += (ce + kl_term).item()
+                n_steps += 1
+
+                s = get_sigma_stats(model)
+                if stage_kind == "backbone":
+                    step_pbar.set_postfix(ce=f"{loss.item() * cfg.gradient_accumulation_steps:.4f}",
+                                          sig_m=f"{s['sigma_mean']:.4f}")
+                else:
+                    step_pbar.set_postfix(ce=f"{ce.item():.4f}", kl=f"{kl_raw.item():.1f}",
+                                          kl_beta=f"{kl_beta:.3f}", sig_m=f"{s['sigma_mean']:.4f}")
+
+            avg_ce = epoch_ce / max(1, n_steps)
+            avg_kl = epoch_kl / max(1, n_steps)
+            avg_kl_term = epoch_kl_term / max(1, n_steps)
+            avg_total = epoch_total / max(1, n_steps)
+            metrics = evaluate_classification_metrics(
+                model, eval_loader, cfg.device, cfg.mixed_precision_dtype, cfg.eval_num_particles,
+                ece_num_bins=cfg.ece_num_bins)
+            elapsed = time.time() - t0
             s = get_sigma_stats(model)
-            step_pbar.set_postfix(ce=f"{ce.item():.4f}", kl=f"{kl_raw.item():.1f}",
-                                  kl_beta=f"{kl_beta:.3f}", sig_m=f"{s['sigma_mean']:.4f}")
 
-        avg_ce      = epoch_ce / max(1, n_steps)
-        avg_kl      = epoch_kl / max(1, n_steps)
-        avg_kl_term = epoch_kl_term / max(1, n_steps)
-        avg_total   = epoch_total / max(1, n_steps)
-        metrics = evaluate_classification_metrics(
-            model, eval_loader, cfg.device, cfg.mixed_precision_dtype, cfg.eval_num_particles,
-            ece_num_bins=cfg.ece_num_bins)
-        elapsed = time.time() - t0
-        s = get_sigma_stats(model)
+            epoch_pbar.set_postfix(ce=f"{avg_ce:.4f}", test_acc=f"{metrics['accuracy']:.4f}",
+                                   sig_m=f"{s['sigma_mean']:.4f}")
 
-        epoch_pbar.set_postfix(ce=f"{avg_ce:.4f}", test_acc=f"{metrics['accuracy']:.4f}",
-                               sig_m=f"{s['sigma_mean']:.4f}")
+            record = {
+                "model": "teacher", "epoch": epoch, "stage": stage_name,
+                "ce_loss": avg_ce, "kl_raw": avg_kl, "kl_term": avg_kl_term,
+                "total_loss": avg_total, "eval_loss": metrics["loss"],
+                "accuracy": metrics["accuracy"], "f1": metrics["f1"],
+                "accuracy_mean": metrics["accuracy_mean"], "accuracy_max": metrics["accuracy_max"],
+                "accuracy_min": metrics["accuracy_min"], "f1_mean": metrics["f1_mean"],
+                "f1_max": metrics["f1_max"], "f1_min": metrics["f1_min"],
+                "sigma_mean": s["sigma_mean"], "sigma_min": s["sigma_min"], "sigma_max": s["sigma_max"],
+                "epoch_time_sec": elapsed,
+            }
+            log_jsonl(cfg.log_file, record)
+            history.append({
+                "epoch": epoch, "stage": stage_name, "accuracy": metrics["accuracy"], "f1": metrics["f1"],
+                "accuracy_mean": metrics["accuracy_mean"], "accuracy_max": metrics["accuracy_max"],
+                "accuracy_min": metrics["accuracy_min"], "f1_mean": metrics["f1_mean"],
+                "f1_max": metrics["f1_max"], "f1_min": metrics["f1_min"],
+                "total_loss": avg_total, "ce_loss": avg_ce, "kl_loss": avg_kl_term,
+            })
 
-        record = {
-            "model": "teacher", "epoch": epoch, "ce_loss": avg_ce, "kl_raw": avg_kl,
-            "kl_term": avg_kl_term, "total_loss": avg_total, "eval_loss": metrics["loss"],
-            "accuracy": metrics["accuracy"], "f1": metrics["f1"],
-            "accuracy_mean": metrics["accuracy_mean"], "accuracy_max": metrics["accuracy_max"],
-            "accuracy_min": metrics["accuracy_min"], "f1_mean": metrics["f1_mean"],
-            "f1_max": metrics["f1_max"], "f1_min": metrics["f1_min"],
-            "sigma_mean": s["sigma_mean"], "sigma_min": s["sigma_min"], "sigma_max": s["sigma_max"],
-            "epoch_time_sec": elapsed,
-        }
-        log_jsonl(cfg.log_file, record)
-        history.append({
-            "epoch": epoch, "accuracy": metrics["accuracy"], "f1": metrics["f1"],
-            "accuracy_mean": metrics["accuracy_mean"], "accuracy_max": metrics["accuracy_max"],
-            "accuracy_min": metrics["accuracy_min"], "f1_mean": metrics["f1_mean"],
-            "f1_max": metrics["f1_max"], "f1_min": metrics["f1_min"],
-            "total_loss": avg_total, "ce_loss": avg_ce, "kl_loss": avg_kl_term,
-        })
-
-        save_bll_checkpoint(model, cfg, latest_ckpt_path)
-        print(f"[latest teacher] epoch={epoch}  eval_loss={metrics['loss']:.4f}"
-              f"  acc_mean={metrics['accuracy_mean']:.4f}"
-              f"  acc[min,max]=[{metrics['accuracy_min']:.4f},{metrics['accuracy_max']:.4f}]"
-              f"  sigma_mean={s['sigma_mean']:.4f}")
-        model.train()
+            save_bll_checkpoint(model, cfg, latest_ckpt_path)
+            print(f"[latest teacher] stage={stage_name}  epoch={epoch}  eval_loss={metrics['loss']:.4f}"
+                  f"  acc_mean={metrics['accuracy_mean']:.4f}"
+                  f"  acc[min,max]=[{metrics['accuracy_min']:.4f},{metrics['accuracy_max']:.4f}]"
+                  f"  sigma_mean={s['sigma_mean']:.4f}")
+            model.train()
 
     ckpt_path = os.path.join(cfg.checkpoint_dir, "teacher_vit_large_bll")
     save_bll_checkpoint(model, cfg, ckpt_path)
@@ -1248,18 +1295,12 @@ def fit_teacher(cfg: Config) -> Tuple[str, List[Dict]]:
 
 def distill_student(cfg: Config, teacher_ckpt_path: str, teacher_model_for_umap: BLLViTClassifier
                     ) -> Tuple[str, List[Dict]]:
-    """Student = ViT-Small KHONG pretrained (distill tu dau). 3-phase
-    schedule + ELBO + GW single-input, giong logic ban CNN.
-
-    LUU Y (fix bug UMAP bi de): tag UMAP cua teacher/student trong giai
-    doan nay la "teacher_distill"/"student_distill" (truoc la "teacher"/
-    "student"). global_step o day la mot counter rieng, doc lap voi
-    global_step trong fit_teacher() -- ca hai deu bat dau tu 0 va cung
-    cham cfg.umap_every_n_steps, nen neu dung chung tag "teacher" thi UMAP
-    cua teacher luc fit (stage 1) se bi GHI DE boi UMAP cua teacher
-    (frozen) o stage nay khi global_step trung nhau (100, 200, ...).
+    """Student training is split into three explicit stages:
+      1) deterministic backbone stage: train backbone + deterministic mean head.
+      2) BLL/ELBO stage: freeze backbone and train Bayesian last layer.
+      3) BLL/ELBO + GW stage: freeze backbone and add the GW structural loss.
     """
-    print(f"\n{'='*80}\nSTAGE 2: DISTILLING STUDENT -- {cfg.student_name}\n{'='*80}")
+    print(f"\n{'='*80}\nSTAGE 1-3: DISTILLING STUDENT (split backbone -> BLL -> GW) -- {cfg.student_name}\n{'='*80}")
 
     student = BLLViTClassifier.from_timm_name(
         cfg.student_name, cfg.num_labels, cfg.student_pretrained,
@@ -1290,147 +1331,185 @@ def distill_student(cfg: Config, teacher_ckpt_path: str, teacher_model_for_umap:
     train_loader, eval_loader = build_cifar100_loaders(cfg, cfg.distill_batch_size)
     n_train = len(train_loader.dataset)
 
-    param_groups = [
-        {"params": student.backbone.parameters(), "lr": cfg.student_learning_rate},
-        {"params": student.head.parameters(),     "lr": cfg.student_learning_rate * cfg.student_head_lr_mult},
-    ]
-    optimizer = torch.optim.AdamW(param_groups, weight_decay=cfg.weight_decay)    
-    total_steps  = (len(train_loader) // cfg.gradient_accumulation_steps) * cfg.student_num_epochs
-    warmup_steps = int(total_steps * cfg.warmup_ratio)
-    scheduler    = torch.optim.lr_scheduler.LambdaLR(
-        optimizer,
-        lambda step: min(1.0, step / max(1, warmup_steps)) *
-                     max(0.0, (total_steps - step) / max(1, total_steps - warmup_steps)),
-    )
-
     s0 = get_sigma_stats(student)
     print(f"[sigma init] mean={s0['sigma_mean']:.5f}  min={s0['sigma_min']:.5f}  max={s0['sigma_max']:.5f}")
-    print(f"[student] K={cfg.num_particles}  batch={cfg.distill_batch_size}  epochs={cfg.student_num_epochs}")
+    print(f"[student] K={cfg.num_particles}  batch={cfg.distill_batch_size}")
 
     history: List[Dict] = []
     student.train()
-    global_step      = 0
+    global_step = 0
     latest_ckpt_path = os.path.join(cfg.checkpoint_dir, "student_vit_small_bll_gw_latest")
 
-    epoch_pbar = tqdm(range(1, cfg.student_num_epochs + 1), desc="student (BLL+GW) epochs", unit="epoch")
-    for epoch in epoch_pbar:
-        beta_kl, gamma = student_schedule_weights(epoch, cfg)
-        phase = ("task-only" if gamma == 0 and beta_kl == 0 else
-                 "posterior" if gamma == 0 else "structural")
-        print(f"\n[schedule] epoch {epoch}/{cfg.student_num_epochs}  "
-              f"phase={phase}  beta_kl={beta_kl:.3f}  gamma={gamma:.3f}")
+    stage_specs = [
+        ("deterministic_backbone", cfg.student_backbone_epochs, "backbone"),
+        ("bll_elbo", cfg.student_bll_epochs, "bll"),
+        ("bll_elbo_gw", cfg.student_gw_epochs, "gw"),
+    ]
 
-        epoch_ce, epoch_kl, epoch_gw, n_steps = 0.0, 0.0, 0.0, 0
-        epoch_kl_term, epoch_gw_term, epoch_total = 0.0, 0.0, 0.0
-        t0 = time.time()
-        optimizer.zero_grad(set_to_none=True)
+    for stage_name, num_epochs, stage_kind in stage_specs:
+        if num_epochs <= 0:
+            continue
 
-        step_pbar = tqdm(enumerate(train_loader), total=len(train_loader),
-                         desc=f"student epoch {epoch}/{cfg.student_num_epochs}",
-                         unit="step", leave=False)
-        for step, (images, labels) in step_pbar:
-            images = images.to(cfg.device, non_blocking=True)
-            labels = labels.to(cfg.device, non_blocking=True)
+        if stage_kind == "backbone":
+            set_backbone_trainable(student, True)
+            set_bll_head_trainable(student, train_mu=True, train_sigma=False)
+            param_groups = [
+                {"params": student.backbone.parameters(), "lr": cfg.student_learning_rate},
+                {"params": [student.head.mu], "lr": cfg.student_learning_rate * cfg.student_head_lr_mult},
+            ]
+            beta_kl, gamma = 0.0, 0.0
+        elif stage_kind == "bll":
+            set_backbone_trainable(student, False)
+            set_bll_head_trainable(student, train_mu=True, train_sigma=True)
+            param_groups = [{"params": student.head.parameters(), "lr": cfg.student_learning_rate * cfg.student_head_lr_mult}]
+            beta_kl, gamma = cfg.kl_beta_max, 0.0
+        else:
+            set_backbone_trainable(student, False)
+            set_bll_head_trainable(student, train_mu=True, train_sigma=True)
+            param_groups = [{"params": student.head.parameters(), "lr": cfg.student_learning_rate * cfg.student_head_lr_mult}]
+            beta_kl, gamma = cfg.kl_beta_max, cfg.gw_gamma_max
 
-            with torch.no_grad(), torch.autocast(
-                device_type="cuda" if cfg.device == "cuda" else "cpu",
-                dtype=cfg.mixed_precision_dtype,
-            ):
-                teacher_logits = teacher(images, cfg.num_particles).float()  # [B,K,C]
+        optimizer = torch.optim.AdamW(param_groups, weight_decay=cfg.weight_decay)
+        total_steps = (len(train_loader) // cfg.gradient_accumulation_steps) * num_epochs
+        warmup_steps = int(total_steps * cfg.warmup_ratio)
+        scheduler = torch.optim.lr_scheduler.LambdaLR(
+            optimizer,
+            lambda step: min(1.0, step / max(1, warmup_steps)) *
+                         max(0.0, (total_steps - step) / max(1, total_steps - warmup_steps)),
+        )
 
-            with torch.autocast(device_type="cuda" if cfg.device == "cuda" else "cpu",
-                                dtype=cfg.mixed_precision_dtype):
-                student_logits = student(images, cfg.num_particles)
-            student_logits = student_logits.float()
-            B, K, C = student_logits.shape
+        print(f"[student stage] name={stage_name}  epochs={num_epochs}  beta_kl={beta_kl:.3f}  gamma={gamma:.3f}")
+        epoch_pbar = tqdm(range(1, num_epochs + 1), desc=f"student {stage_name}", unit="epoch")
+        for epoch in epoch_pbar:
+            epoch_ce, epoch_kl, epoch_gw, n_steps = 0.0, 0.0, 0.0, 0
+            epoch_kl_term, epoch_gw_term, epoch_total = 0.0, 0.0, 0.0
+            t0 = time.time()
+            optimizer.zero_grad(set_to_none=True)
 
-            ce       = F.cross_entropy(student_logits.reshape(B*K, C),
-                                       labels.unsqueeze(1).expand(-1, K).reshape(-1))
-            kl_raw   = student.kl_divergence()
-            kl_scale = cfg.distill_batch_size / max(1, n_train)
-            # GW SINGLE-INPUT: cost matrix K x K rieng cho TUNG sample (Algorithm 1).
-            gw_loss  = (gw_structural_loss(teacher_logits, student_logits, cfg)
-                       if gamma > 0.0 else torch.zeros((), device=cfg.device))
+            step_pbar = tqdm(enumerate(train_loader), total=len(train_loader),
+                             desc=f"student {stage_name} epoch {epoch}/{num_epochs}",
+                             unit="step", leave=False)
+            for step, (images, labels) in step_pbar:
+                images = images.to(cfg.device, non_blocking=True)
+                labels = labels.to(cfg.device, non_blocking=True)
 
-            kl_term   = kl_scale * beta_kl * kl_raw
-            gw_term   = gamma * gw_loss
-            total_raw = ce + kl_term + gw_term
-            loss = total_raw / cfg.gradient_accumulation_steps
-            loss.backward()
+                with torch.no_grad(), torch.autocast(
+                    device_type="cuda" if cfg.device == "cuda" else "cpu",
+                    dtype=cfg.mixed_precision_dtype,
+                ):
+                    teacher_logits = teacher(images, cfg.num_particles).float()
 
-            if (step + 1) % cfg.gradient_accumulation_steps == 0:
-                torch.nn.utils.clip_grad_norm_(student.parameters(), cfg.max_grad_norm)
-                optimizer.step()
-                scheduler.step()
-                optimizer.zero_grad(set_to_none=True)
-                global_step += 1
+                if stage_kind == "backbone":
+                    with torch.autocast(
+                        device_type="cuda" if cfg.device == "cuda" else "cpu",
+                        dtype=cfg.mixed_precision_dtype,
+                    ):
+                        student_logits = student.forward_mean(images)
+                    student_logits = student_logits.float()
+                    ce = F.cross_entropy(student_logits, labels)
+                    kl_raw = torch.zeros((), device=cfg.device)
+                    gw_loss = torch.zeros((), device=cfg.device)
+                    kl_term = torch.zeros((), device=cfg.device)
+                    gw_term = torch.zeros((), device=cfg.device)
+                    total_raw = ce
+                else:
+                    with torch.autocast(
+                        device_type="cuda" if cfg.device == "cuda" else "cpu",
+                        dtype=cfg.mixed_precision_dtype,
+                    ):
+                        student_logits = student(images, cfg.num_particles)
+                    student_logits = student_logits.float()
+                    B, K, C = student_logits.shape
 
-                if global_step % cfg.umap_every_n_steps == 0:
-                    # FIX: tag rieng cho stage distill ("teacher_distill" /
-                    # "student_distill") de KHONG trung voi tag "teacher_fit"
-                    # cua stage 1, du global_step cua 2 stage co the trung nhau.
-                    run_and_plot_dual_umap(
-                        teacher_model=teacher_model_for_umap, student_model=student,
-                        teacher_probe=teacher_umap_probe, student_probe=student_umap_probe,
-                        global_step=global_step, epoch=epoch, phase=phase, cfg=cfg,
-                        teacher_tag="teacher_distill", student_tag="student_distill",
+                    ce = F.cross_entropy(student_logits.reshape(B * K, C),
+                                         labels.unsqueeze(1).expand(-1, K).reshape(-1))
+                    kl_raw = student.kl_divergence()
+                    kl_scale = cfg.distill_batch_size / max(1, n_train)
+                    gw_loss = (
+                        gw_structural_loss(teacher_logits, student_logits, cfg)
+                        if stage_kind == "gw" and gamma > 0.0 else torch.zeros((), device=cfg.device)
                     )
-                    student.train()
+                    kl_term = kl_scale * beta_kl * kl_raw
+                    gw_term = gamma * gw_loss
+                    total_raw = ce + kl_term + gw_term
 
-            epoch_ce      += ce.item()
-            epoch_kl      += kl_raw.item()
-            epoch_gw      += float(gw_loss.item())
-            epoch_kl_term += float(kl_term.item())
-            epoch_gw_term += float(gw_term.item())
-            epoch_total   += float(total_raw.item())
-            n_steps       += 1
+                loss = total_raw / cfg.gradient_accumulation_steps
+                loss.backward()
 
+                if (step + 1) % cfg.gradient_accumulation_steps == 0:
+                    torch.nn.utils.clip_grad_norm_(student.parameters(), cfg.max_grad_norm)
+                    optimizer.step()
+                    scheduler.step()
+                    optimizer.zero_grad(set_to_none=True)
+                    global_step += 1
+
+                    if global_step % cfg.umap_every_n_steps == 0:
+                        run_and_plot_dual_umap(
+                            teacher_model=teacher_model_for_umap, student_model=student,
+                            teacher_probe=teacher_umap_probe, student_probe=student_umap_probe,
+                            global_step=global_step, epoch=epoch, phase=stage_name, cfg=cfg,
+                            teacher_tag=f"teacher_{stage_name}", student_tag=f"student_{stage_name}",
+                        )
+                        student.train()
+
+                epoch_ce += ce.item()
+                epoch_kl += kl_raw.item()
+                epoch_gw += float(gw_loss.item())
+                epoch_kl_term += float(kl_term.item())
+                epoch_gw_term += float(gw_term.item())
+                epoch_total += float(total_raw.item())
+                n_steps += 1
+
+                s = get_sigma_stats(student)
+                if stage_kind == "backbone":
+                    step_pbar.set_postfix(ce=f"{ce.item():.4f}", sig_m=f"{s['sigma_mean']:.4f}")
+                else:
+                    step_pbar.set_postfix(ce=f"{ce.item():.4f}", kl=f"{kl_raw.item():.1f}",
+                                          gw=f"{float(gw_loss.item()):.4f}", sig_m=f"{s['sigma_mean']:.4f}")
+
+            avg_ce = epoch_ce / max(1, n_steps)
+            avg_kl = epoch_kl / max(1, n_steps)
+            avg_gw = epoch_gw / max(1, n_steps)
+            avg_kl_term = epoch_kl_term / max(1, n_steps)
+            avg_gw_term = epoch_gw_term / max(1, n_steps)
+            avg_total = epoch_total / max(1, n_steps)
+            metrics = evaluate_classification_metrics(
+                student, eval_loader, cfg.device, cfg.mixed_precision_dtype, cfg.eval_num_particles,
+                ece_num_bins=cfg.ece_num_bins)
+            elapsed = time.time() - t0
             s = get_sigma_stats(student)
-            step_pbar.set_postfix(ce=f"{ce.item():.4f}", kl=f"{kl_raw.item():.1f}",
-                                  gw=f"{float(gw_loss.item()):.4f}", sig_m=f"{s['sigma_mean']:.4f}")
 
-        avg_ce      = epoch_ce / max(1, n_steps)
-        avg_kl      = epoch_kl / max(1, n_steps)
-        avg_gw      = epoch_gw / max(1, n_steps)
-        avg_kl_term = epoch_kl_term / max(1, n_steps)
-        avg_gw_term = epoch_gw_term / max(1, n_steps)
-        avg_total   = epoch_total / max(1, n_steps)
-        metrics = evaluate_classification_metrics(
-            student, eval_loader, cfg.device, cfg.mixed_precision_dtype, cfg.eval_num_particles,
-            ece_num_bins=cfg.ece_num_bins)
-        elapsed = time.time() - t0
-        s = get_sigma_stats(student)
+            epoch_pbar.set_postfix(ce=f"{avg_ce:.4f}", gw=f"{avg_gw:.4f}",
+                                   test_acc=f"{metrics['accuracy']:.4f}", sig_m=f"{s['sigma_mean']:.4f}")
 
-        epoch_pbar.set_postfix(ce=f"{avg_ce:.4f}", gw=f"{avg_gw:.4f}",
-                               test_acc=f"{metrics['accuracy']:.4f}", sig_m=f"{s['sigma_mean']:.4f}")
+            record = {
+                "model": "student", "epoch": epoch, "stage": stage_name, "phase": stage_name,
+                "beta_kl": beta_kl, "gamma": gamma, "ce_loss": avg_ce, "kl_raw": avg_kl,
+                "gw_loss": avg_gw, "kl_term": avg_kl_term, "gw_term": avg_gw_term,
+                "total_loss": avg_total, "eval_loss": metrics["loss"],
+                "accuracy": metrics["accuracy"], "f1": metrics["f1"],
+                "accuracy_mean": metrics["accuracy_mean"], "accuracy_max": metrics["accuracy_max"],
+                "accuracy_min": metrics["accuracy_min"], "f1_mean": metrics["f1_mean"],
+                "f1_max": metrics["f1_max"], "f1_min": metrics["f1_min"],
+                "sigma_mean": s["sigma_mean"], "sigma_min": s["sigma_min"], "sigma_max": s["sigma_max"],
+                "epoch_time_sec": elapsed,
+            }
+            log_jsonl(cfg.log_file, record)
+            history.append({
+                "epoch": epoch, "stage": stage_name, "accuracy": metrics["accuracy"], "f1": metrics["f1"],
+                "accuracy_mean": metrics["accuracy_mean"], "accuracy_max": metrics["accuracy_max"],
+                "accuracy_min": metrics["accuracy_min"], "f1_mean": metrics["f1_mean"],
+                "f1_max": metrics["f1_max"], "f1_min": metrics["f1_min"],
+                "total_loss": avg_total, "ce_loss": avg_ce,
+                "kl_loss": avg_kl_term, "gw_loss": avg_gw_term,
+            })
 
-        record = {
-            "model": "student", "epoch": epoch, "phase": phase, "beta_kl": beta_kl, "gamma": gamma,
-            "ce_loss": avg_ce, "kl_raw": avg_kl, "gw_loss": avg_gw, "kl_term": avg_kl_term,
-            "gw_term": avg_gw_term, "total_loss": avg_total, "eval_loss": metrics["loss"],
-            "accuracy": metrics["accuracy"], "f1": metrics["f1"],
-            "accuracy_mean": metrics["accuracy_mean"], "accuracy_max": metrics["accuracy_max"],
-            "accuracy_min": metrics["accuracy_min"], "f1_mean": metrics["f1_mean"],
-            "f1_max": metrics["f1_max"], "f1_min": metrics["f1_min"],
-            "sigma_mean": s["sigma_mean"], "sigma_min": s["sigma_min"], "sigma_max": s["sigma_max"],
-            "epoch_time_sec": elapsed,
-        }
-        log_jsonl(cfg.log_file, record)
-        history.append({
-            "epoch": epoch, "accuracy": metrics["accuracy"], "f1": metrics["f1"],
-            "accuracy_mean": metrics["accuracy_mean"], "accuracy_max": metrics["accuracy_max"],
-            "accuracy_min": metrics["accuracy_min"], "f1_mean": metrics["f1_mean"],
-            "f1_max": metrics["f1_max"], "f1_min": metrics["f1_min"],
-            "total_loss": avg_total, "ce_loss": avg_ce,
-            "kl_loss": avg_kl_term, "gw_loss": avg_gw_term,
-        })
-
-        save_bll_checkpoint(student, cfg, latest_ckpt_path)
-        print(f"[latest student] epoch={epoch}  eval_loss={metrics['loss']:.4f}"
-              f"  acc_mean={metrics['accuracy_mean']:.4f}"
-              f"  acc[min,max]=[{metrics['accuracy_min']:.4f},{metrics['accuracy_max']:.4f}]"
-              f"  sigma_mean={s['sigma_mean']:.4f}")
-        student.train()
+            save_bll_checkpoint(student, cfg, latest_ckpt_path)
+            print(f"[latest student] stage={stage_name}  epoch={epoch}  eval_loss={metrics['loss']:.4f}"
+                  f"  acc_mean={metrics['accuracy_mean']:.4f}"
+                  f"  acc[min,max]=[{metrics['accuracy_min']:.4f},{metrics['accuracy_max']:.4f}]"
+                  f"  sigma_mean={s['sigma_mean']:.4f}")
+            student.train()
 
     ckpt_path = os.path.join(cfg.checkpoint_dir, "student_vit_small_bll_gw")
     save_bll_checkpoint(student, cfg, ckpt_path)
