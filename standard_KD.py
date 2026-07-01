@@ -832,7 +832,7 @@ def evaluate_ood_auroc(model: ViTClassifier, id_loader, ood_loader, cfg: Config,
 
 def compute_hessian_trace(model: ViTClassifier, params: List[torch.Tensor],
                           images: torch.Tensor, labels: torch.Tensor,
-                          num_hutchinson_samples: int, seed: Optional[int] = None) -> float:
+                          num_hutchinson_samples: int, seed: Optional[int] = None) -> List[float]:
     # SDPA backend "efficient"/"flash" (mac dinh cua timm ViT) KHONG ho tro
     # double backward -- can ep dung backend "math" (thuan matrix multiply)
     # trong suot qua trinh tinh ca forward LAN 2 lan backward (bac 1 + bac 2).
@@ -856,15 +856,26 @@ def compute_hessian_trace(model: ViTClassifier, params: List[torch.Tensor],
             hv = torch.autograd.grad(dot, params, retain_graph=retain)
             trace_est = sum((h * v).sum().item() for h, v in zip(hv, vecs))
             trace_samples.append(trace_est)
-    return float(np.mean(trace_samples))
+    # Tra ve RAW samples (khong average o day nua) -- averaging + std/CI
+    # duoc lam o evaluate_hessian_trace_sharpness(), tren toan bo
+    # num_hutchinson_samples x eval_batches probe vectors, de phuong sai
+    # bao cao dung voi so luong mau THUC SU da dung (giong ban GWGA).
+    return trace_samples
 
 
 def evaluate_hessian_trace_sharpness(model: ViTClassifier, loader, cfg: Config,
-                                     seed: Optional[int] = None) -> float:
+                                     seed: Optional[int] = None) -> Dict[str, float]:
     """
-    Uoc luong Hessian-trace sharpness cua model HIEN TAI, trung binh qua
+    Uoc luong Hessian-trace sharpness cua model HIEN TAI qua
     cfg.hessian_eval_batches batch co dinh (thuong la build_landscape_loader(cfg))
-    va cfg.hessian_num_hutchinson_samples vector Rademacher moi batch.
+    x cfg.hessian_num_hutchinson_samples vector Rademacher moi batch.
+
+    Tra ve dict {"mean", "std", "sem", "ci95", "n_samples"} thay vi 1 con
+    so duy nhat: Hutchinson la mot estimator NGAU NHIEN, voi mang lon
+    (vd ViT-Large full backbone) phuong sai co the rat lon so voi vai chuc
+    mau, nen dau (+/-) cua "mean" khong dang tin neu ci95 >> |mean|.
+    "std" la do lech chuan cua tung probe (v^T H v), "sem"/"ci95" la sai
+    so chuan / khoang tin cay 95% CUA UOC LUONG TRUNG BINH (sem = std/sqrt(n)).
 
     Can GRADIENT BAC 2 (double backprop) nen KHONG duoc goi duoi
     torch.no_grad(). Chay o FULL PRECISION (khong autocast) vi double
@@ -877,23 +888,33 @@ def evaluate_hessian_trace_sharpness(model: ViTClassifier, loader, cfg: Config,
     model.eval()
     params = [p for p in model.parameters() if p.requires_grad]
 
-    batch_traces = []
+    all_samples: List[float] = []
     for i, (images, labels) in enumerate(loader):
         if i >= cfg.hessian_eval_batches:
             break
         images = images.to(cfg.device, non_blocking=True)
         labels = labels.to(cfg.device, non_blocking=True)
         batch_seed = None if seed is None else seed + i
-        t = compute_hessian_trace(
+        batch_samples = compute_hessian_trace(
             model, params, images, labels,
             num_hutchinson_samples=cfg.hessian_num_hutchinson_samples,
             seed=batch_seed,
         )
-        batch_traces.append(t)
+        all_samples.extend(batch_samples)
 
     if was_training:
         model.train()
-    return float(np.mean(batch_traces)) if batch_traces else float("nan")
+
+    if not all_samples:
+        return {"mean": float("nan"), "std": float("nan"), "sem": float("nan"),
+                "ci95": float("nan"), "n_samples": 0}
+
+    arr = np.asarray(all_samples, dtype=np.float64)
+    n = int(arr.size)
+    mean = float(arr.mean())
+    std = float(arr.std(ddof=1)) if n > 1 else 0.0
+    sem = std / np.sqrt(n) if n > 0 else float("nan")
+    return {"mean": mean, "std": std, "sem": sem, "ci95": 1.96 * sem, "n_samples": n}
 
 
 # =========================================================================
@@ -1557,28 +1578,41 @@ def run_and_save_ood_eval(teacher_model, student_model, cfg: Config) -> dict:
         print(f"[Hessian] Estimating {key} Hessian-trace sharpness "
               f"({cfg.hessian_num_hutchinson_samples} Hutchinson samples x "
               f"{cfg.hessian_eval_batches} batches) ...")
-        r["hessian_trace"] = evaluate_hessian_trace_sharpness(
+        h_stats = evaluate_hessian_trace_sharpness(
             model, landscape_loader, cfg, seed=cfg.hessian_seed)
-        print(f"[Hessian] {key}: Tr(H) ~= {r['hessian_trace']:.4f}")
+        r["hessian_trace"]      = h_stats["mean"]
+        r["hessian_trace_std"]  = h_stats["std"]
+        r["hessian_trace_sem"]  = h_stats["sem"]
+        r["hessian_trace_ci95"] = h_stats["ci95"]
+        r["hessian_trace_n"]    = h_stats["n_samples"]
+        reliable = abs(r["hessian_trace"]) > r["hessian_trace_ci95"]
+        print(f"[Hessian] {key}: Tr(H) ~= {r['hessian_trace']:.4f} "
+              f"+/- {r['hessian_trace_ci95']:.4f} (95% CI, n={r['hessian_trace_n']} probes, "
+              f"std={r['hessian_trace_std']:.4f})"
+              f"{'' if reliable else '  [CI 95% bao gom 0 -- dau (+/-) cua Tr(H) chua du tin cay]'}")
 
         results[key] = r
 
     payload = {}
     for key, r in results.items():
         safe_key = key.split(" ")[0].replace("-", "_").lower()
-        payload[f"{safe_key}_id_scores"]     = np.array(r["id_scores"])
-        payload[f"{safe_key}_ood_scores"]    = np.array(r["ood_scores"])
-        payload[f"{safe_key}_auroc"]         = r["auroc"]
-        payload[f"{safe_key}_ece"]           = r["ece"]
-        payload[f"{safe_key}_hessian_trace"] = r["hessian_trace"]
-        payload[f"{safe_key}_model_key"]     = key
+        payload[f"{safe_key}_id_scores"]          = np.array(r["id_scores"])
+        payload[f"{safe_key}_ood_scores"]         = np.array(r["ood_scores"])
+        payload[f"{safe_key}_auroc"]              = r["auroc"]
+        payload[f"{safe_key}_ece"]                = r["ece"]
+        payload[f"{safe_key}_hessian_trace"]      = r["hessian_trace"]
+        payload[f"{safe_key}_hessian_trace_std"]  = r["hessian_trace_std"]
+        payload[f"{safe_key}_hessian_trace_ci95"] = r["hessian_trace_ci95"]
+        payload[f"{safe_key}_hessian_trace_n"]    = r["hessian_trace_n"]
+        payload[f"{safe_key}_model_key"]          = key
     save_figure_data(cfg, "ood_eval", payload)
 
     summary = {
         key: {
-            "auroc":         r["auroc"],
-            "ece":           r["ece"],
-            "hessian_trace": r["hessian_trace"],
+            "auroc":              r["auroc"],
+            "ece":                r["ece"],
+            "hessian_trace":      r["hessian_trace"],
+            "hessian_trace_ci95": r["hessian_trace_ci95"],
         }
         for key, r in results.items()
     }
@@ -1593,11 +1627,12 @@ def plot_ood_eval(payload: dict, cfg: Config, style: PlotStyle = DEFAULT_STYLE):
         (axes[0], "vit_large", "ViT-Large teacher", style.teacher_color),
         (axes[1], "vit_small", "ViT-Small student (KD)", style.student_color),
     ]:
-        id_scores     = payload.get(f"{prefix}_id_scores")
-        ood_scores    = payload.get(f"{prefix}_ood_scores")
-        auroc         = payload.get(f"{prefix}_auroc")
-        ece           = payload.get(f"{prefix}_ece")
-        hessian_trace = payload.get(f"{prefix}_hessian_trace")
+        id_scores          = payload.get(f"{prefix}_id_scores")
+        ood_scores         = payload.get(f"{prefix}_ood_scores")
+        auroc              = payload.get(f"{prefix}_auroc")
+        ece                = payload.get(f"{prefix}_ece")
+        hessian_trace      = payload.get(f"{prefix}_hessian_trace")
+        hessian_trace_ci95 = payload.get(f"{prefix}_hessian_trace_ci95")
         if id_scores is None or ood_scores is None:
             ax.text(0.5, 0.5, "no data", ha="center", va="center", transform=ax.transAxes)
             continue
@@ -1607,7 +1642,12 @@ def plot_ood_eval(payload: dict, cfg: Config, style: PlotStyle = DEFAULT_STYLE):
                label="OOD: CIFAR-10 test")
         auroc_str = f"{float(auroc):.4f}" if auroc is not None else "n/a"
         ece_str   = f"{float(ece):.4f}" if ece is not None else "n/a"
-        htr_str   = f"{float(hessian_trace):.3g}" if hessian_trace is not None else "n/a"
+        if hessian_trace is None:
+            htr_str = "n/a"
+        elif hessian_trace_ci95 is not None:
+            htr_str = f"{float(hessian_trace):.3g} \u00b1 {float(hessian_trace_ci95):.2g}"
+        else:
+            htr_str = f"{float(hessian_trace):.3g}"
         ax.set_title(
             f"{label}\nAUROC = {auroc_str}   |   ECE = {ece_str}   |   Tr(H) \u2248 {htr_str}",
             fontsize=style.subtitle_fontsize)
@@ -1741,7 +1781,7 @@ def main():
             for key, m in ood_summary.items():
                 print(f"[Step 4b summary] {key}: "
                       f"AUROC={m['auroc']:.4f}  ECE={m['ece']:.4f}  "
-                      f"Tr(H)~={m['hessian_trace']:.4f}")
+                      f"Tr(H)~={m['hessian_trace']:.4f} +/- {m['hessian_trace_ci95']:.4f} (95% CI)")
             plot_ood_eval(ood_payload, CFG)
 
         del teacher_model, student_model
