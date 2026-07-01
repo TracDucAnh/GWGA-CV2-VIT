@@ -1,11 +1,53 @@
 """
-GWGA_single_input_vit_rp.py  (ViT setup + Random Projection augmentation)
-===========================================================================
+GWGA_single_input_random_projection.py  (ViT setup)
+====================================================
 Gromov-Wasserstein Alignment of Bayesian Last-Layer Posteriors
 (Structural Knowledge Distillation) -- SINGLE-INPUT variant (Algorithm 1
-trong paper), CONG THEM tuy chon Random Projection augmentation (Sec 5.3,
-Eq. 9, Proposition 5.5/5.6) lam null-space remedy thay cho batch-pooled
-cost matrix (Algorithm 2).
+trong paper, KHONG phai Algorithm 2 batch-pooled) VOI RANDOM PROJECTION
+(RP) AUGMENTATION cua Sec. 5.3 (Proposition 5.5/5.6, Corollary 5.2,
+Remark 5.3/5.4/5.5).
+
+KHAC BIET DUY NHAT so voi GWGA_single_input.py (moi thu khac -- flow,
+data, eval, plot, tham so -- GIU NGUYEN 100%):
+
+  Van de (Proposition 5.3): tai MOT input x, head la anh xa AFFINE
+  M(h): R^p -> R^C (p = out_features*in_features cua last layer, C =
+  num_labels). Neu p > C, ker M(h) co chieu >= p-C > 0: bat ky nhieu
+  W_i -> W_i + u voi u trong ker M(h) deu KHONG lam thay doi response
+  z_i = M(h)W_i, nen GW single-input (chi thay doi C[i,j]=d(z_i,z_j))
+  hoan toan "mu" truoc cac huong do -- khop tot response-space KHONG
+  dam bao khop weight-space.
+
+  Remedy o day (Sec 5.3, KHONG phai Alg. 2 batch-pooling): voi MOI model
+  (teacher rieng, student rieng), sinh MOT ma tran ngau nhien co dinh
+  A in R^{r x p} (Aij ~ N(0,1)/sqrt(r), sinh 1 lan luc khoi tao head,
+  FREEZE vinh vien -- KHONG phai nn.Parameter, KHONG duoc optimizer cham
+  toi). Voi K particle W^(1..K) sample tai 1 input x, thay response
+  z_i = M(h)W^(i) bang response DA AUGMENT (Eq. 9):
+      z~_i = [ M(h) W^(i) ;  A W^(i) ]  in  R^{C+r}
+  GW cost matrix C[i,j] = d(z~_i, z~_j) duoc tinh tren z~ (khong phai z).
+  Theo Luu y 5.3: A phai nhan truc tiep VECTOR TRONG SO W^(i) (khong
+  phai dac trung backbone h, vi h khong doi giua K particle nen se
+  triet tieu trong hieu z~_i - z~_j) -- do la ly do can truy cap W^(i)
+  tho (khong chi logits) o day.
+
+  Theo Menh de 5.5 (xac suat 1, voi r >= 1 bat ky) va Menh de 5.6 (JL
+  distance-preservation tren ker M(h) voi r = O(eps^-2 log K)), ker cua
+  anh xa da augment M~(h) = [M(h); A] trien tieu HOAN TOAN (Bo de 5.3):
+  ker M~(h) = ker M(h) cap ker A = {0} h.a.s. -- moi huong trong weight
+  space, ke ca huong nam trong ker M(h), deu duoc phan anh (it nhieu, co
+  bien dang duoc kiem soat boi JL) vao khong gian response da augment.
+
+  Chi phi them (dung nhu Bang 2 trong paper): O(K) phep nhan ma
+  tran-vector A W^(i) (r x p nhan p x 1) MOI buoc, KHONG them tham so
+  hoc duoc, KHONG them backbone forward pass, Sinkhorn O(K^2) nhu cu --
+  RE hon nhieu so voi Alg. 2 batch-pooled (O((nK)^2)).
+
+  RP CHI anh huong toi cach tinh cost matrix cho GW structural loss.
+  Task loss (cross-entropy) van dung logits GOC z_i in R^C (KHONG phai
+  z~_i in R^{C+r} -- augmented response KHONG phai logits hop le cho
+  phan loai), va MOI thu khac (ELBO/KL, eval, UMAP, landscape, Hessian,
+  OOD, checkpoint...) deu dung logits goc, giu nguyen 100% logic cu.
 
 Kien truc & du lieu -- Vision Transformer, gan voi tinh than setup "CV-1
 (large-scale classification): Large -> small vision transformer" trong
@@ -30,33 +72,6 @@ de xay cost matrix C in R^{KxK} (pairwise distance giua K particles CUA
 CUNG MOT INPUT). GW duoc giai DOC LAP cho tung sample, vector hoa qua
 batch dim B (khac Algorithm 2 batch-pooled, gop (nK)x(nK)).
 
-=== DIEM MOI SO VOI BAN GOC (GWGA_single_input_vit.py): RANDOM PROJECTION ===
-Proposition 5.3 chi ra: GW khop tren logits C-chieu THUAN tuy (head(h;W) =
-M(h)W + b(h), M(h) = I_C kron h^T) chi rang buoc phan chenh lech trong so
-(W_i - W_j) trong row-space (toi da) C-chieu cua M(h); phan con lai trong
-ker M(h) (chieu >= p - C, p = so trong so cua last layer) HOAN TOAN khong
-bi rang buoc -- tuc GW-tren-logits la dieu kien CAN, KHONG DU cho weight-
-space agreement.
-
-Remedy trien khai o day (Sec 5.3): voi moi ben teacher/student, sinh MOT
-ma tran ngau nhien A in R^{rxp} co dinh (dong bang vinh vien, khong train),
-roi thay logits z_i = M(h)W^(i) bang response DA AUGMENT:
-    z~_i = [ M(h)W^(i) ; A W^(i) ]  in R^{C+r}                     (Eq. 9)
-GW duoc giai tren z~_i thay vi z_i. Theo Proposition 5.5 (JL-type), voi xac
-suat 1, ker(A) giao ker M(h) = {0} ngay ca voi r=1 -- tuc augmented map
-Mf(h) = [M(h); A] KHONG CON null space, nen GW-tren-z~ nhay voi TOAN BO
-sai khac trong khong gian trong so p-chieu (Corollary 5.2), khong chi C
-chieu nhu truoc. Chi phi them: O(K^2) moi Sinkhorn iter (doc lap batch
-size B) -- re hon nhieu so voi remedy con lai (batch pooling, Algorithm 2,
-O((nK)^2)).
-
-Luu y quan trong (Remark 5.3): A W^(i) CHI phu thuoc trong so sample W^(i),
-KHONG phu thuoc input h -- vi h giong nhau cho ca K particle cua CUNG mot
-sample, neu ghep them h (thay vi AW) vao thi no se TRIET TIEU trong hieu
-z~_i - z~_j. Vi vay trong code, rp_features co shape [K, r] (khong co
-chieu batch B) va duoc "broadcast" giong nhau cho moi sample b khi ghep
-voi logits [B, K, C] -> [B, K, C+r] (xem augment_response()).
-
 So voi ban CNN/ResNet truoc -- diem khac biet quan trong:
   ViT (timm) dung LayerNorm, KHONG dung BatchNorm. LayerNorm:
     - KHONG co running statistics (buffer) nhu BatchNorm -- thong ke duoc
@@ -71,9 +86,6 @@ So voi ban CNN/ResNet truoc -- diem khac biet quan trong:
       nen KHONG can logic loai-tru rieng nhu BN affine o ban CNN.
   -> Ket qua: landscape_named_parameters() va compute_loss_landscape()
      don gian hon han ban CNN (khong can quet/khoi-phuc trang thai BN).
-  -> LUU Y THEM cho ban RP nay: rp_matrix la buffer (KHONG phai
-     nn.Parameter), nen tu dong KHONG xuat hien trong named_parameters()
-     / khong can loai tru rieng trong landscape_named_parameters().
 
 Cac diem giu nguyen (logic khong doi, chi doi kien truc/domain):
   - 1 Config dataclass duy nhat.
@@ -135,7 +147,7 @@ warnings.filterwarnings("ignore")
 #       cifar-100/  {train,test}_images.npy, {train,test}_labels.npy,
 #                   {train,test}_coarse_labels.npy, fine_classes.txt, coarse_classes.txt
 #     GWGA/
-#       GWGA_single_input_vit_rp.py   <-- file nay
+#       GWGA_single_input_vit.py   <-- file nay
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 _PROJECT_ROOT = os.path.dirname(_THIS_DIR)
 _DEFAULT_DATASET_ROOT = os.path.join(_PROJECT_ROOT, "dataset")
@@ -210,27 +222,21 @@ class Config:
     gw_outer_iters: int = 10
     gw_distance: str = "cosine"     # "sqeuclidean" | "cosine"
 
-    # ── Random projection augmentation (Sec 5.3 cua paper) ────────────────
-    # Remedy thay the cho batch-pooled cost matrix (Algorithm 2) de "vá"
-    # null space cua M(h) ma Proposition 5.3 chi ra GW-tren-logits-thuan
-    # (C chieu) KHONG nhin thay duoc, ma khong can tang chi phi Sinkhorn
-    # theo O((nK)^2) nhu batch pooling -- chi them O(K^2), DOC LAP batch
-    # size (Proposition 5.5). Ap dung cho CA teacher LAN student (moi ben
-    # mot ma tran A rieng, vi khong gian trong so p = out*in cua 2 ben khac
-    # nhau -- ViT-Large embed_dim=1024 vs ViT-Small embed_dim=384).
-    #   r = rp_dim = round(rp_dim_multiplier * num_labels), vd 1x/4x/16x C
-    #   (xem Sec 6.4 muc 6: ablation sweep r in {C, 4C, 16C}).
-    use_random_projection: bool = True
-    rp_dim_multiplier: float = 4.0
-    rp_dim: int = 0            # tinh = round(rp_dim_multiplier * num_labels) ngay sau khi tao CFG
-    rp_seed: int = 20260701    # seed rieng cho ma tran A_teacher; A_student dung rp_seed + 1
+    # ── Random Projection augmentation (Sec 5.3: null-space remedy THAY
+    # THE cho batch-pooling cua Alg. 2 -- xem Menh de 5.5/5.6, He qua 5.2,
+    # Luu y 5.3/5.4/5.5). z_i = M(h)W^(i) -> z~_i = [M(h)W^(i); A W^(i)],
+    # A in R^{r x p} co dinh, sinh 1 lan, FREEZE vinh vien (khong hoc). ──
+    use_random_projection: bool = True   # False -> tuong duong GWGA_single_input.py (ablation)
+    rp_dim_multiplier: int = 4           # r = rp_dim_multiplier * num_labels (paper sweep r in {C,4C,16C})
+    rp_seed: int = 2025                  # seed cho A_teacher; A_student dung rp_seed+1 (doc lap)
+    rp_dim: int = 0                      # r -- GIA TRI THAT duoc gan lai ngay sau khi tao CFG (xem duoi)
 
     # ── UMAP probe ────────────────────────────────────────────────────────
     umap_every_n_steps: int = 100
     umap_probe_samples: int = 256
     umap_n_neighbors: int = 30
     umap_min_dist: float = 0.1
-    umap_metric: str = "euclidean"
+    umap_metric: str = "cosine"
     umap_n_epochs: int = 500
     umap_seed: int = 42
 
@@ -285,13 +291,12 @@ class Config:
 CFG = Config()
 # YEU CAU 1: teacher duoc fit voi so epoch BANG so epoch distill student.
 CFG.teacher_num_epochs = CFG.student_num_epochs
-# YEU CAU 2 (random projection): tinh r tu multiplier x num_labels ngay sau
-# khi CFG duoc tao, de moi noi khac chi can doc CFG.rp_dim (int co dinh).
-if CFG.use_random_projection:
-    CFG.rp_dim = max(1, int(round(CFG.rp_dim_multiplier * CFG.num_labels)))
+# r = rp_dim_multiplier * C (C = num_labels), theo sweep r in {C,4C,16C}
+# cua ablation 6 trong paper (Sec 6.4, item 6). r=0 <=> use_random_projection=False.
+CFG.rp_dim = (CFG.rp_dim_multiplier * CFG.num_labels) if CFG.use_random_projection else 0
 
-TEACHER_KEY = "ViT-Large (teacher, BLL)"
-STUDENT_KEY = "ViT-Small (student, BLL+GW)"
+TEACHER_KEY = "ViT-Large (teacher, BLL+RP)"
+STUDENT_KEY = "ViT-Small (student, BLL+GW+RP)"
 
 _CMAP_100 = plt.get_cmap("tab20")
 
@@ -539,16 +544,16 @@ class BayesianLastLayer(nn.Module):
     """Mean-field Gaussian posterior tren last layer: q(W) = N(mu, diag(sigma^2)).
     Tuong ung Eq. (3) trong paper.
 
-    Random projection (Sec 5.3, Eq. 9): neu use_random_projection=True, giu
-    them 1 buffer `rp_matrix` A in R^{rxp} (p = out_features*in_features)
-    CO DINH, sinh 1 LAN duy nhat luc khoi tao roi DONG BANG vinh vien
-    (KHONG phai nn.Parameter -- khong bao gio nhan gradient / khong bao
-    gio duoc optimizer cap nhat). Dung de tinh A W^(i) cho tung particle
-    trong so W^(i) da sample (xem project_weights()), roi ghep vao logits
-    truoc khi tinh GW cost matrix (xem augment_response() o phan GW)."""
+    RANDOM PROJECTION (Sec 5.3): neu rp_dim = r > 0, mot ma tran A in
+    R^{r x p} (p = out_features*in_features, tuc so chieu cua W lam
+    FLAT) duoc sinh MOT LAN luc khoi tao (Aij ~ N(0,1)/sqrt(r), dung Bo
+    de 5.3 / Menh de 5.5), luu duoi dang register_buffer (KHONG phai
+    nn.Parameter) nen KHONG bao gio nhan gradient va KHONG duoc
+    optimizer cham toi -- dung "freeze permanently" trong paper. A duoc
+    dung de tao dac trung augmented AW^(i) (Eq. 9), CHI phuc vu GW
+    structural loss; hoan toan khong lien quan toi logits/task loss."""
     def __init__(self, in_features, out_features, prior_std=1.0, init_log_sigma=-2.3,
-                 use_random_projection: bool = False, rp_dim: Optional[int] = None,
-                 rp_seed: Optional[int] = None):
+                rp_dim: int = 0, rp_seed: int = 0):
         super().__init__()
         self.in_features  = in_features
         self.out_features = out_features
@@ -559,31 +564,19 @@ class BayesianLastLayer(nn.Module):
             torch.full((out_features, in_features), float(init_log_sigma))
         )
 
-        # === Random projection augmentation (Sec 5.3, Eq. 9, Prop. 5.5/5.6) ===
-        # A duoc chuan hoa 1/sqrt(r) (Prop 5.6, JL-type guarantee), sinh boi
-        # generator RIENG (seed rp_seed) de KHONG lam xao tron RNG stream
-        # chinh cua training loop -- cung tinh than voi generator rieng cua
-        # Hutchinson estimator o phan Hessian-trace sharpness ben duoi.
-        self.use_random_projection = bool(use_random_projection)
-        self.rp_dim = int(rp_dim) if (self.use_random_projection and rp_dim) else None
-        if self.use_random_projection:
-            assert self.rp_dim is not None and self.rp_dim >= 1, (
-                "rp_dim (r) phai la so nguyen >= 1 khi use_random_projection=True "
-                "(Proposition 5.5 dam bao ker M~(h) = {0} h.c.c. ngay ca voi r=1)."
-            )
+        # ── Random Projection buffer (Sec 5.3, Eq. 9) ───────────────────
+        self.rp_dim = int(rp_dim)
+        p_flat = out_features * in_features
+        if self.rp_dim > 0:
             gen = torch.Generator()
-            if rp_seed is not None:
-                gen.manual_seed(rp_seed)
-            p = out_features * in_features
-            A = torch.randn(self.rp_dim, p, generator=gen) / math.sqrt(self.rp_dim)
-            # Buffer (KHONG phai Parameter): dong bang vinh vien, KHONG co
-            # gradient, nhung VAN duoc luu/nap cung head.state_dict() -- dam
-            # bao khi checkpoint duoc load lai (vd trong distill_student()),
-            # ta dung DUNG mot ma tran A da dung luc train, khong phai ban
-            # sinh lai (co the khac neu seed/stream RNG khac).
-            self.register_buffer("rp_matrix", A)
+            if rp_seed:
+                gen.manual_seed(int(rp_seed))
+            # A = (1/sqrt(r)) * A~, A~_ij ~ N(0,1) -- dung chuan hoa cua
+            # Menh de 5.6 de dam bao JL distance-preservation tren ker M(h).
+            A = torch.randn(self.rp_dim, p_flat, generator=gen) / math.sqrt(self.rp_dim)
         else:
-            self.rp_matrix = None
+            A = torch.zeros(0, p_flat)
+        self.register_buffer("rp_matrix", A)   # [r, p], KHONG train, freeze vinh vien
 
     def sample_weights(self, num_particles):
         sigma = torch.exp(self.log_sigma)
@@ -591,40 +584,31 @@ class BayesianLastLayer(nn.Module):
                           device=self.mu.device, dtype=self.mu.dtype)
         return self.mu.unsqueeze(0) + sigma.unsqueeze(0) * eps
 
-    def project_weights(self, W: torch.Tensor) -> Optional[torch.Tensor]:
-        """
-        W: [K, out_features, in_features] -- cac particle trong so vua
-        sample (tu sample_weights()). Tra ve A W^(i) cho tung particle i,
-        chinh la thanh phan thu hai cua z~_i = [M(h)W^(i) ; A W^(i)] trong
-        Eq. (9). Tra ve None neu random projection dang TAT.
-
-        QUAN TRONG (Remark 5.3): ket qua CHI phu thuoc W (qua chi so
-        particle), KHONG phu thuoc input/feature h -- vi h giong nhau cho
-        ca K particle cua CUNG mot sample, ghep them h (thay vi AW) vao se
-        TRIET TIEU trong hieu z~_i - z~_j.
-        """
-        if not self.use_random_projection:
-            return None
-        K = W.shape[0]
-        W_flat = W.reshape(K, -1).to(self.rp_matrix.dtype)   # [K, p]
-        return W_flat @ self.rp_matrix.t()                    # [K, r]
-
     def forward(self, h, num_particles):
-        """h: [B, D] -> logits: [B, K, C]."""
+        """h: [B, D] -> logits: [B, K, C]. KHONG doi so voi ban goc --
+        day la logits THAT, dung cho task loss / eval / UMAP / landscape."""
         W = self.sample_weights(num_particles)        # [K, out, in]
         return torch.einsum("bd,kcd->bkc", h, W)      # [B, K, out]
 
-    def forward_with_particles(self, h, num_particles):
-        """
-        Giong forward(), nhung tra ve CA logits LAN cac particle trong so W
-        vua sample -- can W de tinh A W^(i) cho random-projection
-        augmentation (Eq. 9). Chi dung rieng trong buoc GW cua
-        distill_student(); cac cho khac (teacher fit, eval, landscape, ...)
-        van dung forward()/sample_weights() nhu cu, KHONG doi hanh vi.
-        """
-        W = self.sample_weights(num_particles)             # [K, out, in]
-        logits = torch.einsum("bd,kcd->bkc", h, W)          # [B, K, out]
+    def sample_particles_and_responses(self, h, num_particles):
+        """Nhu forward(), nhung TRA VE THEM ca cac particle W^(1..K) tho
+        (chua flatten), can thiet de tinh A W^(i) trong rp_features()."""
+        W = self.sample_weights(num_particles)         # [K, out, in]
+        logits = torch.einsum("bd,kcd->bkc", h, W)     # [B, K, out]
         return logits, W
+
+    def rp_features(self, W):
+        """W: [K, out, in] (cac particle sample tai 1 input) -> A W^(i)
+        cho tung particle: [K, r] (Eq. 9, phan thu hai cua z~_i). Doc lap
+        voi h (dung Luu y 5.3: khong the dung dac trung backbone h de
+        augment vi h giong nhau giua K particle nen se triet tieu trong
+        hieu z~_i - z~_j -- phai la ham cua W^(i))."""
+        K = W.shape[0]
+        if self.rp_dim == 0:
+            return W.new_zeros(K, 0)
+        W_flat = W.reshape(K, -1).float()                      # [K, p]
+        rp = F.linear(W_flat, self.rp_matrix.float())          # [K, r] = W_flat @ A^T
+        return rp.to(W.dtype)
 
     def forward_mean(self, h):
         return F.linear(h, self.mu)
@@ -652,13 +636,11 @@ class BLLViTClassifier(nn.Module):
 
     @classmethod
     def from_timm_name(cls, model_name, num_labels, pretrained, prior_std, init_log_sigma,
-                        use_random_projection: bool = False, rp_dim: Optional[int] = None,
-                        rp_seed: Optional[int] = None):
+                       rp_dim: int = 0, rp_seed: int = 0):
         backbone = timm.create_model(model_name, pretrained=pretrained, num_classes=0)
         embed_dim = backbone.num_features
         head = BayesianLastLayer(embed_dim, num_labels,
                                  prior_std=prior_std, init_log_sigma=init_log_sigma,
-                                 use_random_projection=use_random_projection,
                                  rp_dim=rp_dim, rp_seed=rp_seed)
         return cls(backbone, head)
 
@@ -673,11 +655,24 @@ class BLLViTClassifier(nn.Module):
         h = self.backbone_features(images)
         return self.head(h, num_particles)   # [B, K, C]
 
-    def forward_with_particles(self, images, num_particles):
-        """Nhu forward(), nhung tra ve them ca particle trong so W da sample
-        -- dung rieng cho buoc GW + random-projection cua distill_student()."""
+    def forward_for_distill(self, images, num_particles):
+        """MOT backbone forward pass + MOT lan sample K particle duy nhat,
+        tra ve CA HAI:
+          - logits      [B, K, C]     : dung cho task loss (CE) / ELBO.
+          - gw_response [B, K, C+r]   : dung CHI cho GW structural loss
+                                         (Eq. 9: z~_i = [M(h)W^(i); A W^(i)]).
+        Neu head.rp_dim == 0 (use_random_projection=False), gw_response
+        chinh la logits (tuong duong GWGA_single_input.py goc, khong RP).
+        Phan AW^(i) khong phu thuoc h nen duoc broadcast qua batch dim B
+        (xem Luu y 5.3 va docstring rp_features())."""
         h = self.backbone_features(images)
-        return self.head.forward_with_particles(h, num_particles)  # (logits [B,K,C], W [K,out,in])
+        logits, W = self.head.sample_particles_and_responses(h, num_particles)   # [B,K,C], [K,out,in]
+        rp = self.head.rp_features(W)                                            # [K, r]
+        if rp.shape[-1] == 0:
+            return logits, logits
+        rp_b = rp.unsqueeze(0).expand(logits.shape[0], -1, -1)                   # [B, K, r]
+        gw_response = torch.cat([logits, rp_b], dim=-1)                          # [B, K, C+r]
+        return logits, gw_response
 
     def forward_mean(self, images):
         h = self.backbone_features(images)
@@ -691,10 +686,6 @@ class BLLViTClassifier(nn.Module):
         Tham so dung de xay random direction cho loss landscape. Chi loai
         tru "log_sigma" cua BLL head (khong phai thanh phan deterministic
         cua loss landscape theo nghia thong thuong).
-
-        LUU Y (random projection): rp_matrix la buffer (dang trong
-        self.head._buffers), KHONG phai nn.Parameter, nen tu dong KHONG
-        xuat hien trong self.named_parameters() -- khong can loai tru rieng.
 
         KHAC voi ban CNN (ResNet + BatchNorm): ViT dung LayerNorm, vector
         affine weight/bias cua no la 1 chieu va se TU DONG bi zero-out boi
@@ -720,12 +711,7 @@ def save_bll_checkpoint(model: BLLViTClassifier, cfg: Config, path: str):
         "in_features":  model.head.in_features,
         "out_features": model.head.out_features,
         "prior_std":    model.head.prior_std,
-        # Random projection: can luu ca flag + rp_dim de load_bll_checkpoint
-        # tai tao dung SHAPE cho buffer rp_matrix truoc khi load_state_dict
-        # (gia tri thuc su cua A se duoc GHI DE boi head_state_dict ben
-        # tren, dam bao dung CHINH XAC ma tran A da dung luc train).
-        "use_random_projection": model.head.use_random_projection,
-        "rp_dim":       model.head.rp_dim,
+        "rp_dim":       model.head.rp_dim,   # can de tao dung shape buffer rp_matrix khi load
     }, os.path.join(path, "bll_head.pt"))
     with open(os.path.join(path, "bll_marker.json"), "w") as f:
         json.dump({"is_bll_checkpoint": True}, f)
@@ -736,13 +722,12 @@ def load_bll_checkpoint(path: str, model_name: str) -> BLLViTClassifier:
     backbone = timm.create_model(model_name, pretrained=False, num_classes=0)
     backbone.load_state_dict(torch.load(os.path.join(path, "backbone.pt"), map_location="cpu"))
     payload = torch.load(os.path.join(path, "bll_head.pt"), map_location="cpu")
-    head = BayesianLastLayer(
-        payload["in_features"], payload["out_features"],
-        prior_std=payload["prior_std"],
-        use_random_projection=payload.get("use_random_projection", False),
-        rp_dim=payload.get("rp_dim", None),
-        rp_seed=None,  # khong quan trong: rp_matrix se bi GHI DE boi load_state_dict ngay ben duoi
-    )
+    # rp_dim duoc doc lai TU CHECKPOINT (khong phai tu cfg) de dam bao shape
+    # cua buffer rp_matrix khop voi state_dict da luu; rp_seed=0 o day khong
+    # quan trong vi noi dung A se bi ghi de hoan toan boi load_state_dict.
+    head = BayesianLastLayer(payload["in_features"], payload["out_features"],
+                             prior_std=payload["prior_std"],
+                             rp_dim=payload.get("rp_dim", 0), rp_seed=0)
     head.load_state_dict(payload["head_state_dict"])
     return BLLViTClassifier(backbone, head)
 
@@ -917,8 +902,6 @@ def run_and_plot_dual_umap(teacher_model, student_model, teacher_probe, student_
 def pairwise_dist_matrix(resp: torch.Tensor, distance: str) -> torch.Tensor:
     """
     resp: [B, K, C] -- K responses (particle) cho moi sample trong batch.
-    Neu random projection dang BAT, resp o day la response DA AUGMENT
-    (xem augment_response()), tuc C thuc su la C_goc + r.
     Tra ve C: [B, K, K] voi C[b,i,j] = d(resp[b,i], resp[b,j]). Day chinh
     la "single-input" cost matrix trong Algorithm 1: moi sample b trong
     batch co MOT cost matrix K x K rieng (khac voi Algorithm 2
@@ -929,31 +912,6 @@ def pairwise_dist_matrix(resp: torch.Tensor, distance: str) -> torch.Tensor:
         sim = torch.bmm(resp_n, resp_n.transpose(1, 2))     # [B,K,K]
         return 1.0 - sim
     return torch.cdist(resp.float(), resp.float(), p=2.0) ** 2
-
-
-def augment_response(resp: torch.Tensor, rp_features: Optional[torch.Tensor]) -> torch.Tensor:
-    """
-    Ghep response goc voi thanh phan random-projection, tao z~_i cua Eq. (9):
-        z~_i = [ resp_i ; A W^(i) ]  in R^{C + r}
-
-    resp        : [B, K, C]  -- response goc (logits) cho K particle cua
-                  MOI sample trong batch.
-    rp_features : [K, r] hoac None -- A W^(i) (tra ve tu
-                  BayesianLastLayer.project_weights()). CHI phu thuoc chi
-                  so particle i, KHONG phu thuoc sample b (xem Remark 5.3
-                  trong paper: A W^(i) khong phu thuoc h nen giong nhau cho
-                  moi sample trong batch) -> duoc "broadcast" qua chieu B
-                  khi ghep vao resp.
-
-    Neu rp_features=None (random projection TAT), tra ve nguyen resp,
-    tuong duong voi GW-tren-logits-thuan cua ban goc (khong RP).
-    """
-    if rp_features is None:
-        return resp
-    B, K, _C = resp.shape
-    r = rp_features.shape[-1]
-    rp_b = rp_features.unsqueeze(0).expand(B, K, r).to(resp.dtype)
-    return torch.cat([resp, rp_b], dim=-1)          # [B, K, C+r]
 
 
 def compute_entropic_gw(CT, CS, epsilon, sinkhorn_iters, outer_iters):
@@ -992,8 +950,7 @@ def compute_entropic_gw(CT, CS, epsilon, sinkhorn_iters, outer_iters):
 
 
 def gw_structural_loss(teacher_resp, student_resp, cfg: Config):
-    """teacher_resp, student_resp: [B, K, C] (C co the la C_goc + r neu da
-    augment). Tra ve scalar = trung binh GW qua B."""
+    """teacher_resp, student_resp: [B, K, C]. Tra ve scalar = trung binh GW qua B."""
     CT = pairwise_dist_matrix(teacher_resp, cfg.gw_distance).detach()
     CS = pairwise_dist_matrix(student_resp, cfg.gw_distance)
     return compute_entropic_gw(
@@ -1246,13 +1203,6 @@ def fit_teacher(cfg: Config) -> Tuple[str, List[Dict]]:
     qua ELBO. So epoch fit teacher = so epoch distill student (CFG.teacher_num_epochs
     da duoc gan = CFG.student_num_epochs ngay sau khi tao CFG).
 
-    Random projection: neu cfg.use_random_projection=True, head cua teacher
-    duoc khoi tao KEM theo 1 ma tran A_teacher co dinh (seed=cfg.rp_seed).
-    Ma tran nay KHONG anh huong den ELBO / task loss cua teacher trong giai
-    doan fit nay (chi duoc dung SAU, o buoc GW cua distill_student()); no
-    duoc luu kem checkpoint (xem save_bll_checkpoint) de dam bao
-    distill_student() dung lai DUNG mot ma tran A_teacher nay.
-
     LUU Y (fix bug UMAP bi de): tag UMAP cua giai doan nay la "teacher_fit"
     (KHONG phai "teacher" trung voi giai doan distill) -- global_step o day
     la mot counter rieng, doc lap voi global_step trong distill_student().
@@ -1264,21 +1214,19 @@ def fit_teacher(cfg: Config) -> Tuple[str, List[Dict]]:
     """
     print(f"\n{'='*80}\nSTAGE 1: FITTING TEACHER BLL (pretrained backbone) -- {cfg.teacher_name}\n{'='*80}")
 
+    # RP (Sec 5.3): teacher co RIENG mot ma tran A_teacher (rp_seed), doc
+    # lap voi A_student (rp_seed+1, xem distill_student). Teacher fit o day
+    # KHONG dung GW nen A_teacher chua duoc dung toi -- chi can co mat trong
+    # checkpoint (rp_dim luu kem, xem save_bll_checkpoint) de distill_student
+    # doc lai dung shape khi load_bll_checkpoint().
     model = BLLViTClassifier.from_timm_name(
         cfg.teacher_name, cfg.num_labels, cfg.teacher_pretrained,
         cfg.prior_std, cfg.init_log_sigma,
-        use_random_projection=cfg.use_random_projection,
         rp_dim=cfg.rp_dim, rp_seed=cfg.rp_seed,
     )
     model.to(cfg.device)
     if cfg.use_gradient_checkpointing:
         model.enable_gradient_checkpointing()
-
-    if cfg.use_random_projection:
-        print(f"[teacher] Random projection buffer: r={cfg.rp_dim} "
-              f"(={cfg.rp_dim_multiplier}x num_labels), seed={cfg.rp_seed}. "
-              f"Se duoc dung SAU nay trong buoc GW cua distill_student(); "
-              f"KHONG anh huong ELBO/task loss cua teacher o day.")
 
     if not cfg.teacher_finetune_backbone:
         for p in model.backbone.parameters():
@@ -1416,15 +1364,13 @@ def fit_teacher(cfg: Config) -> Tuple[str, List[Dict]]:
 
 
 # =========================================================================
-# STAGE 2: STUDENT DISTILLATION  (ViT-Small, random init, single-input GW
-# + random projection augmentation)
+# STAGE 2: STUDENT DISTILLATION  (ViT-Small, random init, single-input GW)
 # =========================================================================
 
 def distill_student(cfg: Config, teacher_ckpt_path: str, teacher_model_for_umap: BLLViTClassifier
                     ) -> Tuple[str, List[Dict]]:
     """Student = ViT-Small KHONG pretrained (distill tu dau). 3-phase
-    schedule + ELBO + GW single-input (+ random projection augmentation
-    tuy chon, Sec 5.3), giong logic ban CNN.
+    schedule + ELBO + GW single-input, giong logic ban CNN.
 
     LUU Y (fix bug UMAP bi de): tag UMAP cua teacher/student trong giai
     doan nay la "teacher_distill"/"student_distill" (truoc la "teacher"/
@@ -1436,19 +1382,22 @@ def distill_student(cfg: Config, teacher_ckpt_path: str, teacher_model_for_umap:
     """
     print(f"\n{'='*80}\nSTAGE 2: DISTILLING STUDENT -- {cfg.student_name}\n{'='*80}")
 
+    # RP (Sec 5.3): student co RIENG mot ma tran A_student, sinh doc lap
+    # voi A_teacher (rp_seed+1 != rp_seed). Ca hai co CUNG so chieu dich r
+    # (cfg.rp_dim) nen z~_teacher va z~_student CUNG nam trong R^{C+r} --
+    # nhung GW van CHI so sanh hinh hoc NOI TAI tung ben (khong doi hoi
+    # A_teacher = A_student, dung tinh chat "khong can tuong ung xuyen
+    # khong gian" cua GW).
     student = BLLViTClassifier.from_timm_name(
         cfg.student_name, cfg.num_labels, cfg.student_pretrained,
         cfg.prior_std, cfg.init_log_sigma,
-        use_random_projection=cfg.use_random_projection,
-        rp_dim=cfg.rp_dim, rp_seed=(cfg.rp_seed + 1),  # seed KHAC teacher (rp_seed) du shape p cung khac
+        rp_dim=cfg.rp_dim, rp_seed=cfg.rp_seed + 1,
     )
     student.to(cfg.device)
     if cfg.use_gradient_checkpointing:
         student.enable_gradient_checkpointing()
 
-    # Teacher dung de tinh logits distill (frozen, tu checkpoint). Ma tran
-    # A_teacher (rp_matrix) duoc nap lai CHINH XAC tu checkpoint (xem
-    # load_bll_checkpoint), khong phai sinh moi.
+    # Teacher dung de tinh logits distill (frozen, tu checkpoint).
     teacher = load_bll_checkpoint(teacher_ckpt_path, cfg.teacher_name)
     teacher.to(cfg.device)
     teacher.eval()
@@ -1460,17 +1409,6 @@ def distill_student(cfg: Config, teacher_ckpt_path: str, teacher_model_for_umap:
     teacher_model_for_umap.eval()
     for p in teacher_model_for_umap.parameters():
         p.requires_grad_(False)
-
-    if cfg.use_random_projection:
-        print(f"[student] Random projection augmentation: ON  "
-              f"(r={cfg.rp_dim} = {cfg.rp_dim_multiplier}x num_labels={cfg.num_labels}); "
-              f"teacher rp_seed={cfg.rp_seed}, student rp_seed={cfg.rp_seed + 1}. "
-              f"GW se duoc giai tren response da augment z~=[logits; A W] in "
-              f"R^{{{cfg.num_labels}+{cfg.rp_dim}}} (Eq. 9), thay vi chi logits "
-              f"{cfg.num_labels}-chieu -- xem Proposition 5.3/5.5.")
-    else:
-        print("[student] Random projection augmentation: OFF "
-              "(GW tren logits C-chieu THUAN, giong ban single-input goc).")
 
     print(f"[UMAP] Building teacher probe batch ({cfg.umap_probe_samples} samples)...")
     teacher_umap_probe = build_umap_probe_batch(cfg, dataset_name="cifar100")
@@ -1518,50 +1456,31 @@ def distill_student(cfg: Config, teacher_ckpt_path: str, teacher_model_for_umap:
             images = images.to(cfg.device, non_blocking=True)
             labels = labels.to(cfg.device, non_blocking=True)
 
-            # forward_with_particles(): tra ve CA logits LAN cac particle
-            # trong so W da sample -- can W de tinh A W^(i) (random
-            # projection). Khi random projection TAT, hanh vi ve mat logits
-            # giong het forward() cu (chi la sample_weights() duoc goi va
-            # tra ve them, khong doi output logits).
             with torch.no_grad(), torch.autocast(
                 device_type="cuda" if cfg.device == "cuda" else "cpu",
                 dtype=cfg.mixed_precision_dtype,
             ):
-                teacher_logits, teacher_W = teacher.forward_with_particles(images, cfg.num_particles)
-                teacher_logits = teacher_logits.float()
-                teacher_W      = teacher_W.float()
+                # teacher_logits: [B,K,C] (khong dung o day); teacher_gw_resp:
+                # [B,K,C+r] (Eq. 9) -- z~_i cua teacher, CT duoc tinh tu day.
+                _, teacher_gw_resp = teacher.forward_for_distill(images, cfg.num_particles)
+                teacher_gw_resp = teacher_gw_resp.float()  # [B,K,C] hoac [B,K,C+r]
 
             with torch.autocast(device_type="cuda" if cfg.device == "cuda" else "cpu",
                                 dtype=cfg.mixed_precision_dtype):
-                student_logits, student_W = student.forward_with_particles(images, cfg.num_particles)
-            student_logits = student_logits.float()
-            student_W      = student_W.float()
+                student_logits, student_gw_resp = student.forward_for_distill(images, cfg.num_particles)
+            student_logits  = student_logits.float()    # [B,K,C]   -- CE + eval (KHONG bao gio RP)
+            student_gw_resp = student_gw_resp.float()   # [B,K,C+r] -- CHI dung cho GW loss
             B, K, C = student_logits.shape
 
             ce       = F.cross_entropy(student_logits.reshape(B*K, C),
                                        labels.unsqueeze(1).expand(-1, K).reshape(-1))
             kl_raw   = student.kl_divergence()
             kl_scale = cfg.distill_batch_size / max(1, n_train)
-
-            if gamma > 0.0:
-                # === RANDOM PROJECTION AUGMENTATION (Sec 5.3, Eq. 9) ===
-                # Voi moi ben (teacher/student), ghep them A W^(i) (r chieu,
-                # co dinh, khong train) vao logits C chieu truoc khi tinh
-                # cost matrix -- phu toan bo null space cua M(h) ma GW-tren-
-                # logits-thuan bi "mu" (Proposition 5.3), thay vi phai tang
-                # batch de dat full column rank nhu Algorithm 2
-                # (Proposition 5.4). Neu cfg.use_random_projection=False,
-                # project_weights() tra ve None va augment_response() la
-                # identity -> giong het GW single-input ban goc.
-                teacher_rp = teacher.head.project_weights(teacher_W)   # [K, r] hoac None
-                student_rp = student.head.project_weights(student_W)   # [K, r] hoac None
-                teacher_resp = augment_response(teacher_logits, teacher_rp)
-                student_resp = augment_response(student_logits, student_rp)
-                # GW SINGLE-INPUT: cost matrix K x K rieng cho TUNG sample
-                # (Algorithm 1), tren response DA (co the) augment.
-                gw_loss = gw_structural_loss(teacher_resp, student_resp, cfg)
-            else:
-                gw_loss = torch.zeros((), device=cfg.device)
+            # GW SINGLE-INPUT + RP (Alg. 1 + Sec 5.3): cost matrix K x K rieng
+            # cho TUNG sample, nhung tinh TREN response da augment z~ (khong
+            # phai logits z) -- xem forward_for_distill()/rp_features().
+            gw_loss  = (gw_structural_loss(teacher_gw_resp, student_gw_resp, cfg)
+                       if gamma > 0.0 else torch.zeros((), device=cfg.device))
 
             kl_term   = kl_scale * beta_kl * kl_raw
             gw_term   = gamma * gw_loss
@@ -1625,8 +1544,6 @@ def distill_student(cfg: Config, teacher_ckpt_path: str, teacher_model_for_umap:
             "f1_max": metrics["f1_max"], "f1_min": metrics["f1_min"],
             "sigma_mean": s["sigma_mean"], "sigma_min": s["sigma_min"], "sigma_max": s["sigma_max"],
             "epoch_time_sec": elapsed,
-            "use_random_projection": cfg.use_random_projection,
-            "rp_dim": cfg.rp_dim if cfg.use_random_projection else 0,
         }
         log_jsonl(cfg.log_file, record)
         history.append({
@@ -1660,9 +1577,7 @@ def distill_student(cfg: Config, teacher_ckpt_path: str, teacher_model_for_umap:
 # ViT dung LayerNorm (khong co running stats), nen KHONG can context-manager
 # dac biet nhu _bn_use_batch_stats_context o ban CNN. LayerNorm affine
 # (1 chieu) bi zero-out tu dong boi dieu kien "dim() <= 1" trong
-# filter_normalize_direction(), giong het bias. rp_matrix la buffer nen
-# cung tu dong KHONG xuat hien trong landscape_named_parameters() (xem
-# ghi chu trong BLLViTClassifier.landscape_named_parameters()).
+# filter_normalize_direction(), giong het bias.
 
 def get_random_direction_like(params):
     return [torch.randn_like(p) for p in params]
@@ -1990,27 +1905,69 @@ def plot_loss_curves(history: dict, cfg: Config, style: PlotStyle = DEFAULT_STYL
 # =========================================================================
 
 def run_and_save_ood_eval(teacher_model, student_model, cfg: Config) -> dict:
-    """Tinh AUROC OOD (CIFAR-10) cho ca teacher va student, luu du lieu tho."""
-    id_loader  = build_cifar100_loaders(cfg, cfg.batch_size)[1]    # eval split
-    ood_loader = build_cifar10_ood_loader(cfg, cfg.batch_size)
+    """Tinh AUROC OOD (CIFAR-10), ECE (CIFAR-100 test, Naeini/Guo) va
+    Hessian-trace sharpness (Hutchinson estimator, tren build_landscape_loader)
+    cho ca teacher va student, luu du lieu tho.
+
+    Truoc day ham nay CHI tinh AUROC -- compute_ece() va
+    evaluate_hessian_trace_sharpness() da ton tai trong file nhung khong
+    duoc goi o Step 4B. Gio ca 3 metric deu duoc tinh cho model FINAL
+    (checkpoint da load), khop voi Proposition 5.3 (necessary-condition gap
+    can accuracy/ECE/sharpness, khong chi AUROC)."""
+    id_loader        = build_cifar100_loaders(cfg, cfg.batch_size)[1]   # eval split
+    ood_loader       = build_cifar10_ood_loader(cfg, cfg.batch_size)
+    landscape_loader = build_landscape_loader(cfg)                      # cho Hessian-trace
 
     results = {}
     for key, model in [(TEACHER_KEY, teacher_model), (STUDENT_KEY, student_model)]:
         model.to(cfg.device)
+
+        # ---- AUROC (OOD detection: ID=CIFAR-100 vs OOD=CIFAR-10) ----
         print(f"\n[OOD] Evaluating {key} on ID=CIFAR-100 test vs OOD=CIFAR-10 test ...")
         r = evaluate_ood_auroc(model, id_loader, ood_loader, cfg)
-        results[key] = r
         print(f"[OOD] {key}: AUROC = {r['auroc']:.4f}")
+
+        # ---- ECE (calibration, ID=CIFAR-100 test) ----
+        print(f"[ECE] Evaluating {key} calibration on ID=CIFAR-100 test ...")
+        cls_metrics = evaluate_classification_metrics(
+            model, id_loader, cfg.device, cfg.mixed_precision_dtype,
+            cfg.eval_num_particles, ece_num_bins=cfg.ece_num_bins)
+        r["ece"]      = cls_metrics["ece"]        # posterior-predictive (K particles)
+        r["ece_mean"] = cls_metrics["ece_mean"]   # mean-forward (W = mu)
+        print(f"[ECE] {key}: ECE = {r['ece']:.4f}  (ECE mean-forward = {r['ece_mean']:.4f})")
+
+        # ---- Hessian-trace sharpness (Hutchinson, double-backprop) ----
+        print(f"[Hessian] Estimating {key} Hessian-trace sharpness "
+              f"({cfg.hessian_num_hutchinson_samples} Hutchinson samples x "
+              f"{cfg.hessian_eval_batches} batches) ...")
+        r["hessian_trace"] = evaluate_hessian_trace_sharpness(
+            model, landscape_loader, cfg, seed=cfg.hessian_seed)
+        print(f"[Hessian] {key}: Tr(H) ~= {r['hessian_trace']:.4f}")
+
+        results[key] = r
 
     payload = {}
     for key, r in results.items():
         safe_key = key.split(" ")[0].replace("-", "_").lower()
-        payload[f"{safe_key}_id_scores"]  = np.array(r["id_scores"])
-        payload[f"{safe_key}_ood_scores"] = np.array(r["ood_scores"])
-        payload[f"{safe_key}_auroc"]      = r["auroc"]
-        payload[f"{safe_key}_model_key"]  = key
+        payload[f"{safe_key}_id_scores"]     = np.array(r["id_scores"])
+        payload[f"{safe_key}_ood_scores"]    = np.array(r["ood_scores"])
+        payload[f"{safe_key}_auroc"]         = r["auroc"]
+        payload[f"{safe_key}_ece"]           = r["ece"]
+        payload[f"{safe_key}_ece_mean"]      = r["ece_mean"]
+        payload[f"{safe_key}_hessian_trace"] = r["hessian_trace"]
+        payload[f"{safe_key}_model_key"]     = key
     save_figure_data(cfg, "ood_eval", payload)
-    return {key: {"auroc": r["auroc"]} for key, r in results.items()}, payload
+
+    summary = {
+        key: {
+            "auroc":         r["auroc"],
+            "ece":           r["ece"],
+            "ece_mean":      r["ece_mean"],
+            "hessian_trace": r["hessian_trace"],
+        }
+        for key, r in results.items()
+    }
+    return summary, payload
 
 
 def plot_ood_eval(payload: dict, cfg: Config, style: PlotStyle = DEFAULT_STYLE):
@@ -2021,9 +1978,11 @@ def plot_ood_eval(payload: dict, cfg: Config, style: PlotStyle = DEFAULT_STYLE):
         (axes[0], "vit_large", "ViT-Large teacher (BLL)", style.teacher_color),
         (axes[1], "vit_small", "ViT-Small student (BLL+GW)", style.student_color),
     ]:
-        id_scores  = payload.get(f"{prefix}_id_scores")
-        ood_scores = payload.get(f"{prefix}_ood_scores")
-        auroc      = payload.get(f"{prefix}_auroc")
+        id_scores     = payload.get(f"{prefix}_id_scores")
+        ood_scores    = payload.get(f"{prefix}_ood_scores")
+        auroc         = payload.get(f"{prefix}_auroc")
+        ece           = payload.get(f"{prefix}_ece")
+        hessian_trace = payload.get(f"{prefix}_hessian_trace")
         if id_scores is None or ood_scores is None:
             ax.text(0.5, 0.5, "no data", ha="center", va="center", transform=ax.transAxes)
             continue
@@ -2031,8 +1990,12 @@ def plot_ood_eval(payload: dict, cfg: Config, style: PlotStyle = DEFAULT_STYLE):
                label="ID: CIFAR-100 test")
         ax.hist(ood_scores, bins=30, alpha=0.6, density=True, color="tab:red",
                label="OOD: CIFAR-10 test")
-        auroc_str = f"{auroc:.4f}" if auroc is not None else "n/a"
-        ax.set_title(f"{label}\nAUROC = {auroc_str}", fontsize=style.subtitle_fontsize)
+        auroc_str = f"{float(auroc):.4f}" if auroc is not None else "n/a"
+        ece_str   = f"{float(ece):.4f}" if ece is not None else "n/a"
+        htr_str   = f"{float(hessian_trace):.3g}" if hessian_trace is not None else "n/a"
+        ax.set_title(
+            f"{label}\nAUROC = {auroc_str}   |   ECE = {ece_str}   |   Tr(H) \u2248 {htr_str}",
+            fontsize=style.subtitle_fontsize)
         ax.set_xlabel("Predictive entropy (posterior-predictive)", fontsize=style.label_fontsize)
         ax.set_ylabel("Density", fontsize=style.label_fontsize)
         ax.tick_params(labelsize=style.tick_fontsize)
@@ -2099,12 +2062,6 @@ def main():
         print(f"GPU: {torch.cuda.get_device_name(0)}")
     print(f"Teacher epochs == Student epochs (yeu cau): "
           f"{CFG.teacher_num_epochs} == {CFG.student_num_epochs}")
-    if CFG.use_random_projection:
-        print(f"Random projection augmentation (Sec 5.3): ON  "
-              f"r={CFG.rp_dim} (={CFG.rp_dim_multiplier}x num_labels={CFG.num_labels}), "
-              f"rp_seed_teacher={CFG.rp_seed}  rp_seed_student={CFG.rp_seed + 1}")
-    else:
-        print("Random projection augmentation (Sec 5.3): OFF (GW tren logits thuan, ban single-input goc)")
 
     # ============================================================
     # TẠO GLOBAL SHARED DIRECTIONS ĐỂ ĐẢM BẢO BEFORE/AFTER CÙNG DIRECTION
@@ -2160,8 +2117,7 @@ def main():
     student_history: List[Dict] = []
 
     if CFG.run_distillation:
-        print(f"\n>>> STEP 3: Distilling student (BLL+GW single-input"
-              f"{' + random projection' if CFG.use_random_projection else ''}, "
+        print(f"\n>>> STEP 3: Distilling student (BLL+GW single-input, "
               f"{CFG.student_num_epochs} epochs) <<<")
         print(f"[distill] Loading teacher checkpoint for UMAP: {teacher_ckpt_path}")
         teacher_for_umap = load_bll_checkpoint(teacher_ckpt_path, CFG.teacher_name)
@@ -2188,8 +2144,13 @@ def main():
         )
 
         if CFG.run_ood_eval:
-            print("\n>>> STEP 4b: OOD evaluation (ID=CIFAR-100, OOD=CIFAR-10) <<<")
-            _, ood_payload = run_and_save_ood_eval(teacher_model, student_model, CFG)
+            print("\n>>> STEP 4b: OOD AUROC (ID=CIFAR-100, OOD=CIFAR-10) "
+                  "+ ECE + Hessian-trace sharpness (final checkpoints) <<<")
+            ood_summary, ood_payload = run_and_save_ood_eval(teacher_model, student_model, CFG)
+            for key, m in ood_summary.items():
+                print(f"[Step 4b summary] {key}: "
+                      f"AUROC={m['auroc']:.4f}  ECE={m['ece']:.4f}  "
+                      f"ECE_mean={m['ece_mean']:.4f}  Tr(H)~={m['hessian_trace']:.4f}")
             plot_ood_eval(ood_payload, CFG)
 
         del teacher_model, student_model
