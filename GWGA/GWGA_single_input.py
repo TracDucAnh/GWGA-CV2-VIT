@@ -160,7 +160,7 @@ class Config:
     # Stage 1: deterministic backbone training (CE, backbone + deterministic
     # mean head). Stage 2: freeze backbone and train BLL via ELBO + MFVI.
     # Stage 3: freeze backbone and continue BLL + GW distillation.
-    student_num_epochs: int = 10
+    student_num_epochs: int = 20
     student_backbone_epochs: int = 10
     student_bll_epochs: int = 5
     student_gw_epochs: int = 5
