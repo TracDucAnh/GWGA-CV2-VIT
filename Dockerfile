@@ -21,4 +21,4 @@ RUN pip install --upgrade pip && pip install -r requirements.txt
 
 COPY . .
 
-CMD ["python", "GWGA/GWGA_single_input.py"]
+ENTRYPOINT ["python"]

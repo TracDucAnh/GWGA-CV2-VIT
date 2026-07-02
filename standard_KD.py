@@ -887,6 +887,7 @@ def evaluate_hessian_trace_sharpness(model: ViTClassifier, loader, cfg: Config,
     was_training = model.training
     model.eval()
     params = [p for p in model.parameters() if p.requires_grad]
+    n_params = sum(p.numel() for p in params)  # dung de chuan hoa trace/tham so
 
     all_samples: List[float] = []
     for i, (images, labels) in enumerate(loader):
@@ -907,14 +908,35 @@ def evaluate_hessian_trace_sharpness(model: ViTClassifier, loader, cfg: Config,
 
     if not all_samples:
         return {"mean": float("nan"), "std": float("nan"), "sem": float("nan"),
-                "ci95": float("nan"), "n_samples": 0}
+                "ci95": float("nan"), "n_samples": 0, "n_params": n_params,
+                "mean_per_param": float("nan")}
 
     arr = np.asarray(all_samples, dtype=np.float64)
     n = int(arr.size)
     mean = float(arr.mean())
     std = float(arr.std(ddof=1)) if n > 1 else 0.0
     sem = std / np.sqrt(n) if n > 0 else float("nan")
-    return {"mean": mean, "std": std, "sem": sem, "ci95": 1.96 * sem, "n_samples": n}
+    ci95 = 1.96 * sem
+
+    # ---- Robust stats: mean/std tren cac probe Hutchinson (v^T H v) co
+    # the bi vai outlier chi phoi (phan phoi duoi nang), dac biet voi
+    # model lon (nhieu tham so -> phuong sai HVP-per-probe cao hon nhieu
+    # so voi model nho). median/MAD it nhay voi outlier hon mean/std nen
+    # dung de doi chieu. Neu std >> MAD*1.4826 (tuong duong std neu
+    # Gaussian) -> dau hieu duoi nang -> ci95 = 1.96*sem (dua tren gia
+    # dinh CLT/Gaussian) DANH GIA THAP do bat dinh that su, dac biet khi
+    # n con nho (vai tram probe) so voi so chieu tham so cua model.
+    median = float(np.median(arr))
+    mad = float(np.median(np.abs(arr - median))) * 1.4826
+    trimmed_mean = float(np.mean(np.sort(arr)[int(0.1 * n):n - int(0.1 * n)])) if n >= 10 else mean
+    reliable_gaussian_ci = bool(std < 3 * mad) if mad > 0 else True
+
+    return {
+        "mean": mean, "std": std, "sem": sem, "ci95": ci95, "n_samples": n,
+        "median": median, "mad": mad, "trimmed_mean": trimmed_mean,
+        "reliable_gaussian_ci": reliable_gaussian_ci,
+        "n_params": n_params, "mean_per_param": mean / n_params if n_params else float("nan"),
+    }
 
 
 # =========================================================================
@@ -1580,16 +1602,31 @@ def run_and_save_ood_eval(teacher_model, student_model, cfg: Config) -> dict:
               f"{cfg.hessian_eval_batches} batches) ...")
         h_stats = evaluate_hessian_trace_sharpness(
             model, landscape_loader, cfg, seed=cfg.hessian_seed)
-        r["hessian_trace"]      = h_stats["mean"]
-        r["hessian_trace_std"]  = h_stats["std"]
-        r["hessian_trace_sem"]  = h_stats["sem"]
-        r["hessian_trace_ci95"] = h_stats["ci95"]
-        r["hessian_trace_n"]    = h_stats["n_samples"]
+        r["hessian_trace"]        = h_stats["mean"]
+        r["hessian_trace_std"]    = h_stats["std"]
+        r["hessian_trace_sem"]    = h_stats["sem"]
+        r["hessian_trace_ci95"]   = h_stats["ci95"]
+        r["hessian_trace_n"]      = h_stats["n_samples"]
+        r["hessian_trace_median"] = h_stats["median"]
+        r["hessian_trace_mad"]    = h_stats["mad"]
+        r["hessian_trace_trimmed_mean"] = h_stats["trimmed_mean"]
+        r["hessian_trace_n_params"]     = h_stats["n_params"]
+        r["hessian_trace_mean_per_param"] = h_stats["mean_per_param"]
+        r["hessian_trace_reliable_gaussian_ci"] = h_stats["reliable_gaussian_ci"]
+
         reliable = abs(r["hessian_trace"]) > r["hessian_trace_ci95"]
         print(f"[Hessian] {key}: Tr(H) ~= {r['hessian_trace']:.4f} "
               f"+/- {r['hessian_trace_ci95']:.4f} (95% CI, n={r['hessian_trace_n']} probes, "
               f"std={r['hessian_trace_std']:.4f})"
               f"{'' if reliable else '  [CI 95% bao gom 0 -- dau (+/-) cua Tr(H) chua du tin cay]'}")
+        print(f"[Hessian] {key}: median={r['hessian_trace_median']:.4f}, "
+              f"MAD~std={r['hessian_trace_mad']:.4f}, trimmed_mean(10%)={r['hessian_trace_trimmed_mean']:.4f}, "
+              f"mean/param={r['hessian_trace_mean_per_param']:.6g} (n_params={r['hessian_trace_n_params']})")
+        if not h_stats["reliable_gaussian_ci"]:
+            print(f"[Hessian] {key}: [CANH BAO] std >> MAD*1.4826 -- phan phoi probe "
+                  f"co duoi nang, ci95 (dua tren CLT/Gaussian) co the DANH GIA THAP do bat "
+                  f"dinh that su. Nen doi chieu voi median/trimmed_mean thay vi chi dung mean, "
+                  f"va can nhac tang hessian_num_hutchinson_samples/hessian_eval_batches.")
 
         results[key] = r
 
@@ -1604,6 +1641,12 @@ def run_and_save_ood_eval(teacher_model, student_model, cfg: Config) -> dict:
         payload[f"{safe_key}_hessian_trace_std"]  = r["hessian_trace_std"]
         payload[f"{safe_key}_hessian_trace_ci95"] = r["hessian_trace_ci95"]
         payload[f"{safe_key}_hessian_trace_n"]    = r["hessian_trace_n"]
+        payload[f"{safe_key}_hessian_trace_median"]         = r["hessian_trace_median"]
+        payload[f"{safe_key}_hessian_trace_mad"]            = r["hessian_trace_mad"]
+        payload[f"{safe_key}_hessian_trace_trimmed_mean"]   = r["hessian_trace_trimmed_mean"]
+        payload[f"{safe_key}_hessian_trace_n_params"]       = r["hessian_trace_n_params"]
+        payload[f"{safe_key}_hessian_trace_mean_per_param"] = r["hessian_trace_mean_per_param"]
+        payload[f"{safe_key}_hessian_trace_reliable_gaussian_ci"] = r["hessian_trace_reliable_gaussian_ci"]
         payload[f"{safe_key}_model_key"]          = key
     save_figure_data(cfg, "ood_eval", payload)
 
