@@ -148,9 +148,9 @@ class Config:
     # ── Teacher fit (tren pretrained backbone) ───────────────────────────
     # Stage 1: deterministic backbone training (CE, backbone + deterministic
     # mean head). Stage 2: freeze backbone and train BLL via ELBO + MFVI.
-    teacher_num_epochs: int = 15
+    teacher_num_epochs: int = 20
     teacher_backbone_epochs: int = 10
-    teacher_bll_epochs: int = 5
+    teacher_bll_epochs: int = 10
     teacher_kl_beta_max: float = 0.1
     teacher_kl_warmup_frac: float = 0.3
     teacher_finetune_backbone: bool = True
@@ -1168,6 +1168,18 @@ def fit_teacher(cfg: Config) -> Tuple[str, List[Dict]]:
         if num_epochs <= 0:
             continue
 
+        # BUG FIX: kl_beta warmup truoc day dung `global_step` (cong don
+        # xuyen suot MOI stage, ke ca stage "deterministic_backbone" truoc
+        # do). Vi vay khi buoc vao stage "bll_elbo", global_step da >>
+        # kl_warmup_steps (uoc luong TREN RIENG so step cua stage nay) ->
+        # min(1.0, global_step/kl_warmup_steps) = 1.0 NGAY LAP TUC o step
+        # dau tien -> kl_beta nhay thang len teacher_kl_beta_max, warmup
+        # coi nhu khong ton tai. `stage_step` duoc RESET VE 0 o day, rieng
+        # cho MOI stage, chi dung de tinh kl_beta -- KHONG anh huong
+        # `global_step` (van cong don xuyen suot, dung cho UMAP trigger /
+        # logging nhu cu).
+        stage_step = 0
+
         if stage_kind == "backbone":
             set_backbone_trainable(model, True)
             set_bll_head_trainable(model, train_mu=True, train_sigma=False)
@@ -1227,7 +1239,7 @@ def fit_teacher(cfg: Config) -> Tuple[str, List[Dict]]:
                     ce = F.cross_entropy(logits.reshape(B * K, C),
                                          labels.unsqueeze(1).expand(-1, K).reshape(-1))
                     kl_raw = model.kl_divergence()
-                    kl_beta = cfg.teacher_kl_beta_max * min(1.0, global_step / kl_warmup_steps)
+                    kl_beta = cfg.teacher_kl_beta_max * min(1.0, stage_step / kl_warmup_steps)
                     kl_scale = cfg.batch_size / max(1, n_train)
                     kl_term = kl_scale * kl_beta * kl_raw
                     loss = (ce + kl_term) / cfg.gradient_accumulation_steps
@@ -1240,6 +1252,7 @@ def fit_teacher(cfg: Config) -> Tuple[str, List[Dict]]:
                     scheduler.step()
                     optimizer.zero_grad(set_to_none=True)
                     global_step += 1
+                    stage_step += 1
 
                     if global_step % cfg.umap_every_n_steps == 0:
                         run_and_plot_umap(
