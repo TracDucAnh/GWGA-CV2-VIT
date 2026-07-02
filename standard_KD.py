@@ -220,8 +220,8 @@ class Config:
     ece_num_bins: int = 15
 
     # ── Hessian-trace sharpness (Hutchinson estimator) ───────────────────
-    hessian_num_hutchinson_samples: int = 10
-    hessian_eval_batches: int = 5
+    hessian_num_hutchinson_samples: int = 100
+    hessian_eval_batches: int = 10
     hessian_seed: int = 777
 
     # ── OOD evaluation (CIFAR-10 dung lam OOD cho model train tren CIFAR-100) ─
