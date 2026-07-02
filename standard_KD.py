@@ -182,8 +182,8 @@ class Config:
     max_grad_norm: float = 1.0
     mixed_precision_dtype: torch.dtype = torch.bfloat16
 
-    batch_size: int = 512
-    distill_batch_size: int = 256
+    batch_size: int = 1024
+    distill_batch_size: int = 512
     gradient_accumulation_steps: int = 1
     use_gradient_checkpointing: bool = True   # timm ViT ho tro set_grad_checkpointing()
 
