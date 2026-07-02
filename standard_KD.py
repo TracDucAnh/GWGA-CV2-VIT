@@ -220,7 +220,7 @@ class Config:
     ece_num_bins: int = 15
 
     # ── Hessian-trace sharpness (Hutchinson estimator) ───────────────────
-    hessian_num_hutchinson_samples: int = 100
+    hessian_num_hutchinson_samples: int = 50
     hessian_eval_batches: int = 10
     hessian_seed: int = 777
 

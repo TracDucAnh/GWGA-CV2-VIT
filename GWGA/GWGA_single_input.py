@@ -226,7 +226,7 @@ class Config:
     # Tang len 20 x 10 = 200 probe vectors (4x) de CI hep lai; kem theo
     # do std/CI o evaluate_hessian_trace_sharpness() de biet uoc luong co
     # dang tin hay khong, thay vi chi nhin gia tri trung binh.
-    hessian_num_hutchinson_samples: int = 100
+    hessian_num_hutchinson_samples: int = 50
     hessian_eval_batches: int = 10
     hessian_seed: int = 777
 
