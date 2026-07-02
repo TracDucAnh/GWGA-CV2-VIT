@@ -152,7 +152,7 @@ class Config:
     teacher_backbone_epochs: int = 10
     teacher_bll_epochs: int = 10
     teacher_kl_beta_max: float = 0.1
-    teacher_kl_warmup_frac: float = 0.3
+    teacher_kl_warmup_frac: float = 0.5
     teacher_finetune_backbone: bool = True
     teacher_backbone_lr_mult: float = 1   # backbone lr = learning_rate * mult
 
@@ -160,15 +160,15 @@ class Config:
     # Stage 1: deterministic backbone training (CE, backbone + deterministic
     # mean head). Stage 2: freeze backbone and train BLL via ELBO + MFVI.
     # Stage 3: freeze backbone and continue BLL + GW distillation.
-    student_num_epochs: int = 20
+    student_num_epochs: int = 30
     student_backbone_epochs: int = 10
-    student_bll_epochs: int = 5
-    student_gw_epochs: int = 5
+    student_bll_epochs: int = 10
+    student_gw_epochs: int = 10
     phase1_frac: float = 0.3
     phase2_frac: float = 0.3
     phase3_frac: float = 0.4
     kl_beta_max: float = 0.1
-    gw_gamma_max: float = 1.0
+    gw_gamma_max: float = 1
 
     # ── Optimization ──────────────────────────────────────────────────────
     learning_rate: float = 5e-5
@@ -188,7 +188,7 @@ class Config:
     num_particles: int = 8
     eval_num_particles: int = 8
     prior_std: float = 1.0
-    init_log_sigma: float = -2.3
+    init_log_sigma: float = -4.0
 
     # ── Gromov-Wasserstein (single-input, K x K cost matrix moi sample) ──
     gw_epsilon: float = 0.1
